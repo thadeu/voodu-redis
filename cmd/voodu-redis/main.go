@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 var version = "dev"
@@ -135,29 +136,7 @@ func cmdExpand() error {
 		}
 	}
 
-	merged := mergeSpec(composeDefaults(), operatorSpec)
-
-	// Plugin owns the volume bind + command pointing at the
-	// asset, BUT only when operator hasn't supplied their own.
-	// Operator-wins shallow merge already handled `command` /
-	// `volumes` if they're in operatorSpec — these branches
-	// just inject the plugin defaults for the absent case.
-	if _, op := operatorSpec["volumes"]; !op {
-		// 4-segment scoped reference: the asset the plugin
-		// emits below shares (scope, name) with the
-		// statefulset, so we address it explicitly via
-		// ${asset.<scope>.<name>.<key>} rather than relying
-		// on caller-scope inference (which voodu's resolver
-		// doesn't do — 3-segment is reserved for unscoped
-		// global assets).
-		merged["volumes"] = []any{
-			"${asset." + req.Scope + "." + req.Name + ".redis_conf}:/etc/redis/redis.conf:ro",
-		}
-	}
-
-	if _, op := operatorSpec["command"]; !op {
-		merged["command"] = []any{"redis-server", "/etc/redis/redis.conf"}
-	}
+	merged := mergeSpec(composeDefaults(req.Scope, req.Name), operatorSpec)
 
 	asset := manifest{
 		Kind:  "asset",
@@ -217,13 +196,27 @@ func readGeneratedConf() ([]byte, error) {
 
 // composeDefaults is the single source of truth for what the
 // plugin contributes when the operator omits a field. Everything
-// here is overridable via the alias contract: operator declares
-// the same key on the redis block, operator wins.
-func composeDefaults() map[string]any {
+// here is overridable per the merge rules in mergeSpec:
+//
+//   - `env` deep-merges (operator + plugin coexist by key)
+//   - `volumes` additive-merges by destination path (plugin's
+//     defaults always present unless operator declares the same
+//     destination, in which case operator wins for that one
+//     entry)
+//   - everything else: operator-wins outright (alias contract)
+//
+// `volumes` and `command` are scope+name parameterised so the
+// 4-segment asset ref `${asset.<scope>.<name>.redis_conf}`
+// addresses the asset emitted alongside in the same expand call.
+func composeDefaults(scope, name string) map[string]any {
 	return map[string]any{
 		"image":    defaultImage,
 		"replicas": 1,
 		"ports":    []any{"6379"},
+		"command":  []any{"redis-server", "/etc/redis/redis.conf"},
+		"volumes": []any{
+			"${asset." + scope + "." + name + ".redis_conf}:/etc/redis/redis.conf:ro",
+		},
 		"volume_claims": []any{
 			map[string]any{
 				"name":       "data",
@@ -234,8 +227,17 @@ func composeDefaults() map[string]any {
 }
 
 // mergeSpec applies operator overrides on top of plugin
-// defaults. Shallow merge — operator wins outright per key —
-// except for `env`, which deep-merges.
+// defaults. Per-key strategy:
+//
+//   - `env` deep-merges so operator vars and plugin vars coexist
+//   - `volumes` additive-merges by destination path: plugin's
+//     defaults are always preserved (operator can ADD without
+//     losing the redis.conf bind), and operator entries with the
+//     same destination as a plugin default REPLACE that single
+//     default (granular override). Avoids docker's
+//     "duplicate mount point" error too — same target appears
+//     once in the final list.
+//   - everything else: operator-wins outright (alias contract)
 //
 // Empty-but-present operator values (e.g. `volume_claims = []`)
 // are honoured verbatim.
@@ -247,12 +249,16 @@ func mergeSpec(defaults, operator map[string]any) map[string]any {
 	}
 
 	for k, v := range operator {
-		if k == "env" {
+		switch k {
+		case "env":
 			out[k] = mergeEnv(out[k], v)
-			continue
-		}
 
-		out[k] = v
+		case "volumes":
+			out[k] = mergeVolumes(out[k], v)
+
+		default:
+			out[k] = v
+		}
 	}
 
 	return out
@@ -277,6 +283,91 @@ func mergeEnv(defaultEnv, operatorEnv any) any {
 	}
 
 	return out
+}
+
+// mergeVolumes performs additive merge by destination path.
+// Plugin defaults appear first (preserve their order); operator
+// entries either ADD (new destination) or REPLACE (existing
+// destination — operator wins for that single entry, position
+// preserved from where the original was).
+//
+// Why dedup matters: docker rejects `docker run` when two -v
+// flags target the same in-container path with
+// "Duplicate mount point: /path". Without this dedup the
+// operator would have to remove the plugin default manually,
+// defeating the "always-on default + selective override" intent.
+//
+// Format expected: "src:dst[:mode]" (Linux convention). Entries
+// that don't parse (single-token, missing colon) are kept
+// verbatim under their literal key — better to surface as a
+// downstream error than silently coerce.
+func mergeVolumes(defaultVols, operatorVols any) any {
+	a, _ := defaultVols.([]any)
+	b, _ := operatorVols.([]any)
+
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+
+	type entry struct {
+		raw    string
+		target string
+	}
+
+	byTarget := make(map[string]int, len(a)+len(b))
+	order := make([]entry, 0, len(a)+len(b))
+
+	addOrReplace := func(s string) {
+		t := volumeTarget(s)
+
+		if t == "" {
+			// Unparseable — keep verbatim as a unique entry,
+			// indexed by the raw string so operator's identical
+			// duplicate doesn't double-add. Downstream docker
+			// will surface the malformed mount as the real
+			// error.
+			t = "_raw:" + s
+		}
+
+		if idx, exists := byTarget[t]; exists {
+			order[idx] = entry{raw: s, target: t}
+			return
+		}
+
+		byTarget[t] = len(order)
+		order = append(order, entry{raw: s, target: t})
+	}
+
+	for _, v := range a {
+		if s, ok := v.(string); ok {
+			addOrReplace(s)
+		}
+	}
+
+	for _, v := range b {
+		if s, ok := v.(string); ok {
+			addOrReplace(s)
+		}
+	}
+
+	out := make([]any, 0, len(order))
+	for _, e := range order {
+		out = append(out, e.raw)
+	}
+
+	return out
+}
+
+// volumeTarget extracts the in-container destination path from
+// a "src:dst[:mode]" volume spec. Returns "" when the spec is
+// malformed (no colon).
+func volumeTarget(s string) string {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+
+	return parts[1]
 }
 
 func emitOK(data any) {
