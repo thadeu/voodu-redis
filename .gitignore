@@ -1,0 +1,4 @@
+bin/voodu-redis
+dist/
+*.test
+coverage.out
