@@ -143,8 +143,15 @@ func cmdExpand() error {
 	// `volumes` if they're in operatorSpec — these branches
 	// just inject the plugin defaults for the absent case.
 	if _, op := operatorSpec["volumes"]; !op {
+		// 4-segment scoped reference: the asset the plugin
+		// emits below shares (scope, name) with the
+		// statefulset, so we address it explicitly via
+		// ${asset.<scope>.<name>.<key>} rather than relying
+		// on caller-scope inference (which voodu's resolver
+		// doesn't do — 3-segment is reserved for unscoped
+		// global assets).
 		merged["volumes"] = []any{
-			"${asset." + req.Name + ".redis_conf}:/etc/redis/redis.conf:ro",
+			"${asset." + req.Scope + "." + req.Name + ".redis_conf}:/etc/redis/redis.conf:ro",
 		}
 	}
 
