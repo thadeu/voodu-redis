@@ -1,8 +1,10 @@
 name: redis
-version: 0.1.0
-description: Voodu macro plugin that expands `redis { ... }` HCL blocks into statefulset manifests.
+version: 0.2.0
+description: Voodu macro plugin that expands `redis { ... }` HCL blocks into a fan-out (asset + statefulset) with a production-ready redis.conf.
 homepage: https://github.com/thadeu/voodu-redis
 
 commands:
   - name: expand
-    help: Macro entrypoint — read expand request from stdin, emit statefulset manifest envelope on stdout. Invoked by the controller during `vd apply`; not meant for direct use.
+    help: Macro entrypoint — invoked by the controller during `vd apply`. Reads `{kind, scope, name, spec}` JSON from stdin and emits an envelope with [asset, statefulset] manifests on stdout. Direct invocation example: `echo '{"kind":"redis","name":"x"}' | voodu-redis expand`.
+  - name: get-conf
+    help: Print the production-ready redis.conf the plugin ships. Operators inspect, copy, or replace this output to customise defaults — edit ../conf/redis.conf in place, or substitute this script for a templated generator. Stdout IS the conf consumed by `expand`.

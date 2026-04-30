@@ -1,35 +1,51 @@
 // Command voodu-redis expands a `redis "<scope>" "<name>" { … }`
-// HCL block into a statefulset manifest. The macro is an ALIAS
-// of statefulset with sensible defaults: every statefulset
-// attribute the operator declares wins; the plugin only fills
-// in what's missing.
+// HCL block into a fan-out manifest pair: an `asset` carrying a
+// production-ready redis.conf, plus a `statefulset` that
+// bind-mounts that conf and runs `redis-server` against it.
 //
-// Custom redis.conf / ACLs / TLS files are supplied via the
-// `asset` kind separately and referenced in `volumes` — the
-// plugin doesn't carry knobs for them. Same posture as every
-// other macro plugin: dumb alias, smart asset kind.
+// The conf bytes come from `bin/get-conf` (a bash script in
+// the plugin dir) — operators can edit the conf in-place or
+// substitute the script for a templated generator without
+// rebuilding this binary.
 //
 // # Plugin contract
 //
-// stdin: { kind, scope, name, spec } — same shape voodu's
-// controller persists for any kind.
+// stdin (one JSON object — the standard plugin expand request):
 //
-// stdout: envelope with data = a statefulset Manifest.
+//	{ "kind": "redis", "scope": "...", "name": "...", "spec": {…} }
 //
-// # Defaults the plugin contributes
+// stdout (envelope wrapping an array of two manifests):
+//
+//	{
+//	  "status": "ok",
+//	  "data": [
+//	    { "kind": "asset",       "scope": "...", "name": "...", "spec": { "files": { "redis_conf": "<bytes>" } } },
+//	    { "kind": "statefulset", "scope": "...", "name": "...", "spec": { … } }
+//	  ]
+//	}
+//
+// # Defaults (alias-contract: operator-wins for declared keys)
 //
 //	image       = "redis:7-alpine"
 //	replicas    = 1
-//	command     = ["redis-server", "--appendonly", "yes"]
+//	command     = ["redis-server", "/etc/redis/redis.conf"]
 //	ports       = ["6379"]
 //	volume_claim "data" { mount_path = "/data" }
+//	volumes     = ["${asset.<name>.redis_conf}:/etc/redis/redis.conf:ro"]
+//
+// To inspect the manifest a bare block produces, run:
+//
+//	echo '{"kind":"redis","name":"x"}' | voodu-redis expand
 package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 )
 
 var version = "dev"
@@ -49,7 +65,7 @@ type envelope struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type statefulset struct {
+type manifest struct {
 	Kind  string         `json:"kind"`
 	Scope string         `json:"scope,omitempty"`
 	Name  string         `json:"name"`
@@ -58,16 +74,13 @@ type statefulset struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-redis <expand|defaults|--version>")
+		emitErr("usage: voodu-redis <expand|--version>")
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
 	case "--version", "-v", "version":
 		fmt.Println(version)
-
-	case "defaults":
-		emitOK(composeDefaults())
 
 	case "expand":
 		if err := cmdExpand(); err != nil {
@@ -76,11 +89,20 @@ func main() {
 		}
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|defaults)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand)", os.Args[1]))
 		os.Exit(1)
 	}
 }
 
+// cmdExpand reads the operator's block spec from stdin, merges
+// it on top of plugin defaults, fetches the redis.conf via
+// `bin/get-conf` (a sibling script in the plugin dir), and
+// emits an [asset, statefulset] pair.
+//
+// The subprocess call to get-conf is deliberate — it lets
+// operators substitute the script with a templated generator
+// without rebuilding this Go binary. The contract is "stdout
+// of get-conf is the redis.conf bytes, verbatim".
 func cmdExpand() error {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -93,7 +115,16 @@ func cmdExpand() error {
 	}
 
 	if req.Name == "" {
-		return fmt.Errorf("expand request missing required field 'name'")
+		return errors.New("expand request missing required field 'name'")
+	}
+
+	confBytes, err := readGeneratedConf()
+	if err != nil {
+		return fmt.Errorf("get-conf: %w", err)
+	}
+
+	if len(confBytes) == 0 {
+		return errors.New("get-conf returned empty output (redis.conf must not be empty)")
 	}
 
 	var operatorSpec map[string]any
@@ -106,27 +137,85 @@ func cmdExpand() error {
 
 	merged := mergeSpec(composeDefaults(), operatorSpec)
 
-	emitOK(statefulset{
+	// Plugin owns the volume bind + command pointing at the
+	// asset, BUT only when operator hasn't supplied their own.
+	// Operator-wins shallow merge already handled `command` /
+	// `volumes` if they're in operatorSpec — these branches
+	// just inject the plugin defaults for the absent case.
+	if _, op := operatorSpec["volumes"]; !op {
+		merged["volumes"] = []any{
+			"${asset." + req.Name + ".redis_conf}:/etc/redis/redis.conf:ro",
+		}
+	}
+
+	if _, op := operatorSpec["command"]; !op {
+		merged["command"] = []any{"redis-server", "/etc/redis/redis.conf"}
+	}
+
+	asset := manifest{
+		Kind:  "asset",
+		Scope: req.Scope,
+		Name:  req.Name,
+		Spec: map[string]any{
+			"files": map[string]any{
+				"redis_conf": string(confBytes),
+			},
+		},
+	}
+
+	statefulset := manifest{
 		Kind:  "statefulset",
 		Scope: req.Scope,
 		Name:  req.Name,
 		Spec:  merged,
-	})
+	}
+
+	emitOK([]manifest{asset, statefulset})
 
 	return nil
 }
 
+// readGeneratedConf invokes bin/get-conf in the plugin directory
+// and returns its stdout. VOODU_PLUGIN_DIR is injected by the
+// controller when running plugins; falls back to the directory
+// containing the binary itself for direct CLI invocation
+// (smoke testing, `voodu-redis expand < req.json`).
+func readGeneratedConf() ([]byte, error) {
+	dir := os.Getenv("VOODU_PLUGIN_DIR")
+	if dir == "" {
+		exe, err := os.Executable()
+		if err == nil {
+			dir = filepath.Dir(filepath.Dir(exe))
+		}
+	}
+
+	if dir == "" {
+		return nil, errors.New("plugin dir not resolvable (VOODU_PLUGIN_DIR unset and exe path lookup failed)")
+	}
+
+	script := filepath.Join(dir, "bin", "get-conf")
+
+	out, err := exec.Command(script).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, fmt.Errorf("%s exited %d: %s", script, exitErr.ExitCode(), exitErr.Stderr)
+		}
+
+		return nil, fmt.Errorf("%s: %w", script, err)
+	}
+
+	return out, nil
+}
+
 // composeDefaults is the single source of truth for what the
-// plugin contributes when the operator omits a field. The
-// command runs `redis-server --appendonly yes` so a zero-config
-// block (`redis "data" "cache" {}`) gets a durable cache out of
-// the box. Operator who needs a real config supplies their own
-// `command` + a redis.conf via an `asset` block + `volumes`.
+// plugin contributes when the operator omits a field. Everything
+// here is overridable via the alias contract: operator declares
+// the same key on the redis block, operator wins.
 func composeDefaults() map[string]any {
 	return map[string]any{
 		"image":    defaultImage,
 		"replicas": 1,
-		"command":  []any{"redis-server", "--appendonly", "yes"},
 		"ports":    []any{"6379"},
 		"volume_claims": []any{
 			map[string]any{

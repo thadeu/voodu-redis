@@ -38,10 +38,11 @@ install-local: build
 	@if [ -z "$(PLUGINS_ROOT)" ]; then \
 		echo "PLUGINS_ROOT is required (e.g. /opt/voodu/plugins)"; exit 1; \
 	fi
-	@mkdir -p $(PLUGINS_ROOT)/redis/bin
+	@mkdir -p $(PLUGINS_ROOT)/redis/bin $(PLUGINS_ROOT)/redis/conf
 	cp $(BIN) $(PLUGINS_ROOT)/redis/bin/voodu-redis
-	cp bin/expand $(PLUGINS_ROOT)/redis/bin/
+	cp bin/expand bin/get-conf $(PLUGINS_ROOT)/redis/bin/
 	chmod +x $(PLUGINS_ROOT)/redis/bin/*
+	cp conf/redis.conf $(PLUGINS_ROOT)/redis/conf/
 	cp plugin.yml $(PLUGINS_ROOT)/redis/
 	cp install uninstall $(PLUGINS_ROOT)/redis/ 2>/dev/null || true
 	@echo "installed into $(PLUGINS_ROOT)/redis"

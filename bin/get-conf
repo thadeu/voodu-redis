@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# get-conf — print the production-ready redis.conf this plugin
+# ships. The Go-side `expand` invokes this script at apply time
+# to obtain the bytes embedded into the generated `asset`
+# manifest, so whatever this script prints to stdout becomes
+# the config the redis container runs with.
+#
+# Operators have three customisation paths:
+#
+#   1. Edit ../conf/redis.conf in place. This script just `cat`s
+#      it; the next plugin invocation picks up the new content.
+#
+#   2. Replace the body of this script with a generator (heredoc
+#      with env interpolation, jinja-like templating, whatever).
+#      Stdout IS the conf — keep it as raw redis.conf format and
+#      the plugin won't notice.
+#
+#   3. Bypass entirely: declare your own asset block in HCL and
+#      override the redis block's volumes to mount your asset.
+#      The plugin still emits its default asset/statefulset, but
+#      your override takes precedence (alias contract).
+#
+# Failure modes the plugin handles:
+#   - non-zero exit  → expand fails, surfaces stderr to the operator
+#   - empty stdout   → expand fails: "redis.conf must not be empty"
+
+set -euo pipefail
+
+exec cat "$(dirname "$0")/../conf/redis.conf"
