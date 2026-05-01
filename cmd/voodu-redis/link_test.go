@@ -119,67 +119,54 @@ func TestRedisPasswordFromSpecEnv(t *testing.T) {
 // can be absent and the URL falls through to no-auth.
 func TestBuildRedisURL_PriorityOrder(t *testing.T) {
 	cases := []struct {
-		name string
-		from *dispatchRefWithState
-		want string
+		name                string
+		scope, providerName string
+		spec, config        map[string]any
+		want                string
 	}{
 		{
 			name: "config wins over spec.env",
-			from: &dispatchRefWithState{
-				Scope: "clowk-lp",
-				Name:  "redis",
-				Spec: map[string]any{
-					"ports": []any{"6379"},
-					"env":   map[string]any{"REDIS_PASSWORD": "from-env"},
-				},
-				Config: map[string]any{"REDIS_PASSWORD": "from-config"},
+			scope: "clowk-lp", providerName: "redis",
+			spec: map[string]any{
+				"ports": []any{"6379"},
+				"env":   map[string]any{"REDIS_PASSWORD": "from-env"},
 			},
-			want: "redis://default:from-config@redis.clowk-lp.voodu:6379",
+			config: map[string]any{"REDIS_PASSWORD": "from-config"},
+			want:   "redis://default:from-config@redis.clowk-lp.voodu:6379",
 		},
 		{
 			name: "spec.env when no config",
-			from: &dispatchRefWithState{
-				Scope: "clowk-lp",
-				Name:  "redis",
-				Spec: map[string]any{
-					"ports": []any{"6379"},
-					"env":   map[string]any{"REDIS_PASSWORD": "from-env"},
-				},
+			scope: "clowk-lp", providerName: "redis",
+			spec: map[string]any{
+				"ports": []any{"6379"},
+				"env":   map[string]any{"REDIS_PASSWORD": "from-env"},
 			},
 			want: "redis://default:from-env@redis.clowk-lp.voodu:6379",
 		},
 		{
 			name: "no auth when neither set",
-			from: &dispatchRefWithState{
-				Scope: "clowk-lp",
-				Name:  "redis",
-				Spec:  map[string]any{"ports": []any{"6379"}},
-			},
+			scope: "clowk-lp", providerName: "redis",
+			spec: map[string]any{"ports": []any{"6379"}},
 			want: "redis://redis.clowk-lp.voodu:6379",
 		},
 		{
 			name: "non-default port carries through",
-			from: &dispatchRefWithState{
-				Scope: "data",
-				Name:  "cache",
-				Spec:  map[string]any{"ports": []any{"6380"}},
-				Config: map[string]any{"REDIS_PASSWORD": "p"},
-			},
-			want: "redis://default:p@cache.data.voodu:6380",
+			scope: "data", providerName: "cache",
+			spec:   map[string]any{"ports": []any{"6380"}},
+			config: map[string]any{"REDIS_PASSWORD": "p"},
+			want:   "redis://default:p@cache.data.voodu:6380",
 		},
 		{
 			name: "unscoped redis (rare but legal)",
-			from: &dispatchRefWithState{
-				Name: "cache",
-				Spec: map[string]any{"ports": []any{"6379"}},
-			},
+			scope: "", providerName: "cache",
+			spec: map[string]any{"ports": []any{"6379"}},
 			want: "redis://cache.voodu:6379",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := buildRedisURL(tc.from)
+			got, err := buildRedisURL(tc.scope, tc.providerName, tc.spec, tc.config)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -197,18 +184,11 @@ func TestBuildRedisURL_PriorityOrder(t *testing.T) {
 // the URL stays parseable. Pin the behaviour so we don't drift
 // into manual concatenation later.
 func TestBuildRedisURL_PasswordWithSpecialChars(t *testing.T) {
-	from := &dispatchRefWithState{
-		Scope: "clowk-lp",
-		Name:  "redis",
-		Spec:  map[string]any{"ports": []any{"6379"}},
-		Config: map[string]any{
-			// Realistic gnarly password — double-quote, slash, @,
-			// colon, hash. Anything goes through randomgen tools.
-			"REDIS_PASSWORD": "p@ss/word:#1",
-		},
-	}
-
-	got, err := buildRedisURL(from)
+	got, err := buildRedisURL(
+		"clowk-lp", "redis",
+		map[string]any{"ports": []any{"6379"}},
+		map[string]any{"REDIS_PASSWORD": "p@ss/word:#1"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,15 +1,18 @@
-// Plugin command implementations for `vd redis:link` and
-// `vd redis:unlink`. The dispatch endpoint on the controller
-// (POST /plugin/redis/link) feeds the plugin a JSON envelope on
-// stdin describing the provider (`from`) and consumer (`to`)
-// manifests; this file decodes that envelope, builds the
-// connection URL, and emits an `actions` list the controller
-// applies on the consumer's config bucket.
+// Plugin command implementations for `vd redis:link`,
+// `vd redis:unlink`, and `vd redis:new-password`. Each command:
 //
-// The plugin stays purely transformative — no controller HTTP
-// calls, no store access. Every store mutation is described by
-// the `actions` list in the response and executed by the
-// controller. Same posture as `expand`: input → output.
+//  1. Reads its argv from os.Args[2:] (provider/consumer refs).
+//  2. Reads invocation context from stdin (a small JSON
+//     envelope the controller writes) — `controller_url` and
+//     `plugin_dir` are the only fields we use today.
+//  3. Calls back to the controller's HTTP API to fetch the
+//     state it needs (provider's manifest spec + config).
+//  4. Builds the connection URL, emits an `actions` list the
+//     controller applies on the consumer's config bucket.
+//
+// The plugin is fully autonomous — it owns its argv shape,
+// owns its state lookups, owns its action emission. CLI and
+// server are dumb passthrough.
 
 package main
 
@@ -17,38 +20,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
-// dispatchInput mirrors the JSON shape the controller writes to
-// the plugin's stdin in handlers_plugin_dispatch.go. We don't
-// share types with the controller (separate repo, separate
-// binary) so the schema is repeated here. Field names + JSON
-// tags MUST match — operator-facing breakage would surface as
-// "plugin link silently does nothing".
-type dispatchInput struct {
-	Plugin  string                 `json:"plugin"`
-	Command string                 `json:"command"`
-	From    *dispatchRefWithState  `json:"from,omitempty"`
-	To      *dispatchRefWithState  `json:"to,omitempty"`
-	Args    []string               `json:"args,omitempty"`
-	Extra   map[string]any         `json:"extra,omitempty"`
-}
-
-type dispatchRefWithState struct {
-	Kind   string         `json:"kind,omitempty"`
-	Scope  string         `json:"scope,omitempty"`
-	Name   string         `json:"name"`
-	Spec   map[string]any `json:"spec,omitempty"`
-	Config map[string]any `json:"config,omitempty"`
+// invocationContext is the JSON envelope the controller writes
+// to stdin. Plugin reads it once at startup to learn where to
+// call back. Args don't appear here — they arrive via os.Args.
+type invocationContext struct {
+	Plugin        string `json:"plugin"`
+	Command       string `json:"command"`
+	ControllerURL string `json:"controller_url,omitempty"`
+	PluginDir     string `json:"plugin_dir,omitempty"`
+	NodeName      string `json:"node_name,omitempty"`
 }
 
 // dispatchOutput is the envelope-data shape the controller
-// expects on stdout. `message` is the operator-facing one-liner
-// the CLI prints after success; `actions` is the queue the
-// controller applies post-invoke.
+// expects on stdout. `message` is the operator-facing one-liner;
+// `actions` is the queue the controller applies post-invoke.
 type dispatchOutput struct {
 	Message string           `json:"message"`
 	Actions []dispatchAction `json:"actions"`
@@ -68,65 +60,80 @@ type dispatchAction struct {
 // node-redis, redis-py, ioredis, go-redis all check first).
 const consumerEnvVar = "REDIS_URL"
 
-// cmdLink reads the dispatch envelope from stdin, builds the
-// connection URL using the provider's spec + config, and emits
-// a config_set action the controller applies on the consumer.
+// cmdLink wires a redis provider to a consumer.
 //
-// Password resolution priority (matches the description in the
-// link/unlink discussion):
-//   1. `from.config["REDIS_PASSWORD"]` — operator set via
-//      `vd config set -s <provider-scope> -n <provider-name>
-//      REDIS_PASSWORD=...`. Most common shape for secrets.
-//   2. `from.spec.env["REDIS_PASSWORD"]` — declared inline in
-//      the operator's HCL `env = {...}` block.
-//   3. None — emit the URL without auth (`redis://host:port`).
-//      Operator is using an open redis. Common in dev / behind
-//      private networks.
+// Args (os.Args[2:]):
 //
-// User defaults to "default" (Redis 6+ ACL convention) so
-// `redis://default:password@host:port` is the form clients
-// expect when a password is set.
+//	[0] provider scope/name (e.g. "clowk-lp/redis")
+//	[1] consumer scope/name (e.g. "clowk-lp/web")
 //
-// Host is the FQDN voodu0 publishes for the provider's scoped
-// alias: `<name>.<scope>.voodu`. Port comes from the spec's
-// declared ports[0] (operator-supplied or plugin default 6379).
+// Reads invocation context from stdin to find controller_url,
+// then calls /describe and /config to gather the provider's
+// state. Builds redis://default:<password>@<host>:<port> and
+// emits a config_set action on the consumer.
+//
+// `-h` / `--help` short-circuits the network calls and prints
+// usage on stdout for the operator.
 func cmdLink() error {
-	in, err := readDispatchInput()
+	args := os.Args[2:]
+
+	if hasHelpFlag(args) {
+		fmt.Println(linkHelp)
+		return nil
+	}
+
+	if len(args) < 2 {
+		return fmt.Errorf("usage: vd redis:link <provider-scope/name> <consumer-scope/name>")
+	}
+
+	providerRef := args[0]
+	consumerRef := args[1]
+
+	provScope, provName := splitScopeName(providerRef)
+	consScope, consName := splitScopeName(consumerRef)
+
+	if provName == "" {
+		return fmt.Errorf("invalid provider ref %q (expected scope/name)", providerRef)
+	}
+
+	if consName == "" {
+		return fmt.Errorf("invalid consumer ref %q (expected scope/name)", consumerRef)
+	}
+
+	ctx, err := readInvocationContext()
 	if err != nil {
 		return err
 	}
 
-	if in.From == nil {
-		return fmt.Errorf("link: missing `from` (provider)")
-	}
+	client := newControllerClient(ctx.ControllerURL)
 
-	if in.To == nil {
-		return fmt.Errorf("link: missing `to` (consumer)")
-	}
-
-	if in.From.Name == "" {
-		return fmt.Errorf("link: provider name must be non-empty")
-	}
-
-	if in.To.Name == "" {
-		return fmt.Errorf("link: consumer name must be non-empty")
-	}
-
-	connURL, err := buildRedisURL(in.From)
+	// Plugins that emit a statefulset (today: every voodu-redis-
+	// like plugin) fetch the spec via /describe.
+	spec, err := client.fetchSpec("statefulset", provScope, provName)
 	if err != nil {
-		return fmt.Errorf("link: %w", err)
+		return fmt.Errorf("describe %s: %w", providerRef, err)
+	}
+
+	config, err := client.fetchConfig(provScope, provName)
+	if err != nil {
+		return fmt.Errorf("config get %s: %w", providerRef, err)
+	}
+
+	connURL, err := buildRedisURL(provScope, provName, spec, config)
+	if err != nil {
+		return fmt.Errorf("build url: %w", err)
 	}
 
 	out := dispatchOutput{
 		Message: fmt.Sprintf("linked %s → %s (%s)",
-			refOrName(in.From.Scope, in.From.Name),
-			refOrName(in.To.Scope, in.To.Name),
+			refOrName(provScope, provName),
+			refOrName(consScope, consName),
 			consumerEnvVar),
 		Actions: []dispatchAction{
 			{
 				Type:  "config_set",
-				Scope: in.To.Scope,
-				Name:  in.To.Name,
+				Scope: consScope,
+				Name:  consName,
 				KV:    map[string]string{consumerEnvVar: connURL},
 			},
 		},
@@ -135,90 +142,39 @@ func cmdLink() error {
 	return writeDispatchOutput(out)
 }
 
-// cmdNewPassword rotates the redis password. Generates a fresh
-// random password and emits a config_set action so the next
-// `vd apply` of the redis manifest picks it up via cmdExpand's
-// idempotent password resolution and re-materialises the asset
-// with the new requirepass directive — that asset content
-// change cascades through the stamping pipeline as a normal
-// rolling restart.
+// cmdUnlink emits a config_unset action on the consumer.
+// Doesn't require provider state — just the consumer ref.
 //
-// Operator workflow:
+// Args (os.Args[2:]):
 //
-//   vd redis:new-password clowk-lp/redis     # rotate the secret
-//   vd apply -f infra/redis                   # propagate to redis.conf
-//   vd redis:link clowk-lp/redis clowk-lp/web # re-emit URL with new pwd
-//
-// The two follow-up steps are manual on purpose for v1: the
-// plugin doesn't track linked consumers yet (no
-// REDIS_LINKED_CONSUMERS bookkeeping), so it can't auto-reissue
-// every consumer's URL. Future iteration: track + auto-reissue.
-//
-// Reads `from` (the redis being rotated). `to` is intentionally
-// not consulted — rotate is a unary verb.
-func cmdNewPassword() error {
-	in, err := readDispatchInput()
-	if err != nil {
-		return err
-	}
-
-	if in.From == nil {
-		return fmt.Errorf("new-password: missing target (`from`)")
-	}
-
-	if in.From.Name == "" {
-		return fmt.Errorf("new-password: target name must be non-empty")
-	}
-
-	fresh, err := generatePassword()
-	if err != nil {
-		return fmt.Errorf("new-password: %w", err)
-	}
-
-	out := dispatchOutput{
-		Message: fmt.Sprintf("rotated REDIS_PASSWORD for %s — run `vd apply -f <your-hcl>` to refresh redis.conf, then `vd redis:link` for each consumer that needs the new URL",
-			refOrName(in.From.Scope, in.From.Name)),
-		Actions: []dispatchAction{
-			{
-				Type:  "config_set",
-				Scope: in.From.Scope,
-				Name:  in.From.Name,
-				KV:    map[string]string{passwordKey: fresh},
-			},
-		},
-	}
-
-	return writeDispatchOutput(out)
-}
-
-// cmdUnlink emits a config_unset action on the consumer to
-// remove the previously-injected REDIS_URL. Doesn't actually
-// require provider state — the consumer ref alone is enough —
-// but we accept the same input shape as `link` for symmetry,
-// so the operator's call shape is identical between the two.
+//	[0] (ignored, kept for symmetry with link) provider ref
+//	[1] consumer scope/name to clear
 func cmdUnlink() error {
-	in, err := readDispatchInput()
-	if err != nil {
-		return err
+	args := os.Args[2:]
+
+	if hasHelpFlag(args) {
+		fmt.Println(unlinkHelp)
+		return nil
 	}
 
-	if in.To == nil {
-		return fmt.Errorf("unlink: missing `to` (consumer)")
+	if len(args) < 2 {
+		return fmt.Errorf("usage: vd redis:unlink <provider-scope/name> <consumer-scope/name>")
 	}
 
-	if in.To.Name == "" {
-		return fmt.Errorf("unlink: consumer name must be non-empty")
+	consScope, consName := splitScopeName(args[1])
+	if consName == "" {
+		return fmt.Errorf("invalid consumer ref %q (expected scope/name)", args[1])
 	}
 
 	out := dispatchOutput{
 		Message: fmt.Sprintf("unlinked %s (%s removed)",
-			refOrName(in.To.Scope, in.To.Name),
+			refOrName(consScope, consName),
 			consumerEnvVar),
 		Actions: []dispatchAction{
 			{
 				Type:  "config_unset",
-				Scope: in.To.Scope,
-				Name:  in.To.Name,
+				Scope: consScope,
+				Name:  consName,
 				Keys:  []string{consumerEnvVar},
 			},
 		},
@@ -227,17 +183,112 @@ func cmdUnlink() error {
 	return writeDispatchOutput(out)
 }
 
-// buildRedisURL constructs the connection URL clients should
-// dial. Returns an error only on outright invalid state (no
-// host derivable); falls through to a no-auth URL when the
-// password is just absent (legitimate use case).
-func buildRedisURL(from *dispatchRefWithState) (string, error) {
-	host := redisHost(from.Scope, from.Name)
-	port := redisPort(from.Spec)
+// cmdNewPassword rotates the redis password.
+//
+// Args (os.Args[2:]):
+//
+//	[0] target scope/name (the redis to rotate)
+//
+// Generates a fresh random password, emits a config_set action
+// on the redis itself. Operator runs `vd apply` next to
+// propagate to redis.conf, then `vd redis:link` per consumer
+// to refresh URLs.
+func cmdNewPassword() error {
+	args := os.Args[2:]
 
-	password := redisPasswordFromConfig(from.Config)
+	if hasHelpFlag(args) {
+		fmt.Println(newPasswordHelp)
+		return nil
+	}
+
+	if len(args) < 1 {
+		return fmt.Errorf("usage: vd redis:new-password <scope/name>")
+	}
+
+	scope, name := splitScopeName(args[0])
+	if name == "" {
+		return fmt.Errorf("invalid ref %q (expected scope/name)", args[0])
+	}
+
+	fresh, err := generatePassword()
+	if err != nil {
+		return fmt.Errorf("generate: %w", err)
+	}
+
+	out := dispatchOutput{
+		Message: fmt.Sprintf("rotated REDIS_PASSWORD for %s — run `vd apply` to refresh redis.conf, then `vd redis:link` per consumer to refresh URLs",
+			refOrName(scope, name)),
+		Actions: []dispatchAction{
+			{
+				Type:  "config_set",
+				Scope: scope,
+				Name:  name,
+				KV:    map[string]string{passwordKey: fresh},
+			},
+		},
+	}
+
+	return writeDispatchOutput(out)
+}
+
+// Help text for each command — emitted when -h/--help is in
+// os.Args. The plugin owns its own help; the CLI is a dumb
+// pass-through that doesn't intercept these flags.
+const (
+	linkHelp = `Usage: vd redis:link <provider-scope/name> <consumer-scope/name>
+
+Inject the redis provider's connection URL into the consumer's
+config bucket. The consumer auto-restarts to pick up the new env.
+
+Example:
+  vd redis:link clowk-lp/redis clowk-lp/web`
+
+	unlinkHelp = `Usage: vd redis:unlink <provider-scope/name> <consumer-scope/name>
+
+Remove the previously-injected REDIS_URL from the consumer's
+config bucket. Consumer auto-restarts.
+
+Example:
+  vd redis:unlink clowk-lp/redis clowk-lp/web`
+
+	newPasswordHelp = `Usage: vd redis:new-password <scope/name>
+
+Rotate the redis password. Generates a fresh 256-bit random
+password and stores it in the redis's config bucket. Operator
+runs 'vd apply' next to propagate to redis.conf (asset re-
+materialise → rolling restart), then 'vd redis:link' for each
+consumer that needs the new URL.
+
+Example:
+  vd redis:new-password clowk-lp/redis`
+)
+
+// hasHelpFlag reports whether -h or --help is anywhere in the
+// args slice. CLI passes flags through verbatim, so the plugin
+// is responsible for detecting and rendering its own help.
+func hasHelpFlag(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// buildRedisURL constructs the redis://… URL clients dial.
+// Password resolution priority (matches the previous design):
+//
+//  1. config["REDIS_PASSWORD"] (operator's `vd config set`)
+//  2. spec.env["REDIS_PASSWORD"] (operator's HCL env block)
+//  3. None — emit no-auth URL
+func buildRedisURL(scope, name string, spec, config map[string]any) (string, error) {
+	host := redisHost(scope, name)
+	port := redisPort(spec)
+
+	password := redisPasswordFromConfig(config)
 	if password == "" {
-		password = redisPasswordFromSpecEnv(from.Spec)
+		password = redisPasswordFromSpecEnv(spec)
 	}
 
 	u := &url.URL{
@@ -252,10 +303,8 @@ func buildRedisURL(from *dispatchRefWithState) (string, error) {
 	return u.String(), nil
 }
 
-// redisHost is the voodu0 FQDN for a scoped statefulset:
-// `<name>.<scope>.voodu`. Unscoped (singleton) plugins fall
-// back to `<name>.voodu` — same convention BuildNetworkAliases
-// in the controller emits.
+// redisHost is the voodu0 FQDN: `<name>.<scope>.voodu` (or
+// `<name>.voodu` when unscoped).
 func redisHost(scope, name string) string {
 	scope = strings.ToLower(strings.TrimSpace(scope))
 	name = strings.ToLower(strings.TrimSpace(name))
@@ -267,10 +316,10 @@ func redisHost(scope, name string) string {
 	return name + "." + scope + ".voodu"
 }
 
-// redisPort returns the port the consumer should dial. Reads
-// `spec.ports[0]`; falls back to 6379 (redis default) when the
-// spec didn't declare any. Plugin defaults already include
-// `["6379"]` so this is mostly belt-and-braces.
+// redisPort extracts the connection port from the manifest spec.
+// `spec.ports[0]` wins; falls back to 6379 (redis default).
+// Strips any "host:" prefix so loopback-rewritten ports
+// (`127.0.0.1:6379`) still produce 6379.
 func redisPort(spec map[string]any) int {
 	const defaultPort = 6379
 
@@ -288,10 +337,6 @@ func redisPort(spec map[string]any) int {
 		return defaultPort
 	}
 
-	// Strip "host:" prefix if operator wrote loopback-only form
-	// like "127.0.0.1:6379". The container always listens on
-	// the bare port; the host bind has no bearing on the
-	// container-network URL we're building here.
 	if i := strings.LastIndex(first, ":"); i >= 0 {
 		first = first[i+1:]
 	}
@@ -305,9 +350,6 @@ func redisPort(spec map[string]any) int {
 	return port
 }
 
-// redisPasswordFromConfig pulls REDIS_PASSWORD from the merged
-// config bucket the controller pre-fetched. Returns "" when
-// absent — caller falls through to the spec.env path next.
 func redisPasswordFromConfig(config map[string]any) string {
 	if config == nil {
 		return ""
@@ -320,8 +362,6 @@ func redisPasswordFromConfig(config map[string]any) string {
 	return ""
 }
 
-// redisPasswordFromSpecEnv pulls REDIS_PASSWORD from the
-// provider's spec.env (HCL-declared). Returns "" when absent.
 func redisPasswordFromSpecEnv(spec map[string]any) string {
 	if spec == nil {
 		return ""
@@ -339,45 +379,162 @@ func redisPasswordFromSpecEnv(spec map[string]any) string {
 	return ""
 }
 
-// readDispatchInput reads the controller's stdin payload and
-// decodes it into the typed shape. Empty stdin is an error —
-// the controller always sends at least `{plugin, command}`.
-func readDispatchInput() (*dispatchInput, error) {
+// readInvocationContext decodes the JSON envelope the controller
+// wrote to stdin. Empty stdin is OK — falls back to env vars
+// for direct CLI invocation (smoke testing).
+func readInvocationContext() (*invocationContext, error) {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return nil, fmt.Errorf("read stdin: %w", err)
 	}
 
-	if len(raw) == 0 {
-		return nil, fmt.Errorf("empty stdin (controller should always supply a JSON payload)")
+	ctx := &invocationContext{}
+
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, ctx); err != nil {
+			return nil, fmt.Errorf("decode stdin: %w", err)
+		}
 	}
 
-	var in dispatchInput
-
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return nil, fmt.Errorf("decode stdin: %w", err)
+	// Fallbacks for direct invocation outside the controller —
+	// useful for `voodu-redis link a b` smoke testing without
+	// the dispatch endpoint.
+	if ctx.ControllerURL == "" {
+		ctx.ControllerURL = os.Getenv("VOODU_CONTROLLER_URL")
 	}
 
-	return &in, nil
+	if ctx.PluginDir == "" {
+		ctx.PluginDir = os.Getenv("VOODU_PLUGIN_DIR")
+	}
+
+	return ctx, nil
 }
 
 // writeDispatchOutput encodes the dispatch result inside the
-// standard plugin envelope (status=ok, data=<output>) so the
-// controller's envelope-parsing layer picks it up cleanly.
+// standard plugin envelope.
 func writeDispatchOutput(out dispatchOutput) error {
 	enc := json.NewEncoder(os.Stdout)
 
 	return enc.Encode(envelope{Status: "ok", Data: out})
 }
 
-// refOrName produces the operator-facing identifier for a
-// manifest. Scoped resources render as "scope/name"; unscoped
-// (rare for redis) as just "name". Used in the success message
-// so operators see the shape they typed in.
+// splitScopeName parses "scope/name" or just "name". Empty
+// scope when no slash. Mirrors splitJobRef in the CLI; kept
+// independent so the plugin doesn't import voodu internals.
+func splitScopeName(ref string) (scope, name string) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", ""
+	}
+
+	if i := strings.Index(ref, "/"); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+
+	return "", ref
+}
+
 func refOrName(scope, name string) string {
 	if scope == "" {
 		return name
 	}
 
 	return scope + "/" + name
+}
+
+// controllerClient is the tiny HTTP client the plugin uses to
+// call back into the controller. Just two endpoints today:
+// /describe (manifest spec) and /config (env bucket).
+type controllerClient struct {
+	baseURL string
+	http    *http.Client
+}
+
+func newControllerClient(baseURL string) *controllerClient {
+	return &controllerClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		http:    &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// fetchSpec calls GET /describe?kind=&scope=&name= and returns
+// the manifest's spec field as a generic map.
+func (c *controllerClient) fetchSpec(kind, scope, name string) (map[string]any, error) {
+	if c.baseURL == "" {
+		return nil, fmt.Errorf("no controller_url available (set VOODU_CONTROLLER_URL or run via dispatch endpoint)")
+	}
+
+	u := fmt.Sprintf("%s/describe?kind=%s&scope=%s&name=%s",
+		c.baseURL,
+		url.QueryEscape(kind),
+		url.QueryEscape(scope),
+		url.QueryEscape(name),
+	)
+
+	resp, err := c.http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("describe %s/%s/%s: HTTP %d: %s", kind, scope, name, resp.StatusCode, body)
+	}
+
+	var env struct {
+		Data struct {
+			Manifest struct {
+				Spec map[string]any `json:"spec"`
+			} `json:"manifest"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, fmt.Errorf("decode describe response: %w", err)
+	}
+
+	return env.Data.Manifest.Spec, nil
+}
+
+// fetchConfig calls GET /config?scope=&name= and returns the
+// merged config bucket as a string-typed map (REDIS_PASSWORD
+// is a string, etc.) wrapped as map[string]any so the URL
+// builder can use the same shape it expects from the spec.
+func (c *controllerClient) fetchConfig(scope, name string) (map[string]any, error) {
+	if c.baseURL == "" {
+		return nil, fmt.Errorf("no controller_url available")
+	}
+
+	u := fmt.Sprintf("%s/config?scope=%s&name=%s",
+		c.baseURL,
+		url.QueryEscape(scope),
+		url.QueryEscape(name),
+	)
+
+	resp, err := c.http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("config get %s/%s: HTTP %d: %s", scope, name, resp.StatusCode, body)
+	}
+
+	var env struct {
+		Data map[string]string `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return nil, fmt.Errorf("decode config response: %w", err)
+	}
+
+	out := make(map[string]any, len(env.Data))
+	for k, v := range env.Data {
+		out[k] = v
+	}
+
+	return out, nil
 }
