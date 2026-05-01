@@ -57,18 +57,6 @@ func cmdInfo() error {
 
 	connURL, _ := buildRedisURL(scope, name, spec, config)
 
-	password := redisPasswordFromConfig(config)
-	passwordSource := "config bucket (vd config get -s " + scope + " -n " + name + " REDIS_PASSWORD)"
-
-	if password == "" {
-		password = redisPasswordFromSpecEnv(spec)
-		passwordSource = "HCL spec.env"
-	}
-
-	if password == "" {
-		passwordSource = "(none — open auth, no requirepass set)"
-	}
-
 	// Data volume the plugin's defaults set up. Operator can
 	// override volume_claims; we read the resolved spec to show
 	// what's actually configured.
@@ -93,6 +81,7 @@ func cmdInfo() error {
 	out := strings.Builder{}
 
 	fmt.Fprintf(&out, "redis/%s\n\n", refOrName(scope, name))
+	fmt.Fprintf(&out, "  plugin:          voodu-redis v%s\n", version)
 	fmt.Fprintf(&out, "  image:           %s\n", image)
 	fmt.Fprintf(&out, "  host:            %s\n", host)
 	fmt.Fprintf(&out, "  port:            %d\n", port)
