@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# See bin/link for why these shims exist.
+exec "$(dirname "$0")/voodu-redis" help "$@"

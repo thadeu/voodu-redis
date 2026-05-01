@@ -83,7 +83,7 @@ type manifest struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-redis <expand|link|unlink|new-password|--version>")
+		emitErr("usage: voodu-redis <expand|link|unlink|new-password|info|help|--version>")
 		os.Exit(1)
 	}
 
@@ -115,10 +115,60 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "info":
+		if err := cmdInfo(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "help":
+		// `vd redis -h` / `vd redis --help` reaches us here
+		// (CLI synthesizes a "help" command call). Plugin owns
+		// its own overview text. No envelope — operator wants
+		// plain text on stdout.
+		printPluginOverview()
+
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|help)", os.Args[1]))
 		os.Exit(1)
 	}
+}
+
+// printPluginOverview emits the plugin-level help — what
+// commands voodu-redis exposes, brief description of each, how
+// to invoke. This is what `vd redis -h` shows the operator.
+//
+// The CLI doesn't auto-render from plugin.yml metadata —
+// passthrough means the plugin author owns the help text
+// verbatim, so operators see the real example invocations
+// (with redis, not <plugin> placeholder), the actual
+// arg shapes, and any caveats specific to this plugin.
+func printPluginOverview() {
+	fmt.Println(`voodu-redis — managed redis instances via the voodu plugin contract
+
+Commands:
+  vd redis:link <provider> <consumer>
+      Inject the redis URL into the consumer's config.
+      Consumer auto-restarts to pick up the new env.
+
+  vd redis:unlink <provider> <consumer>
+      Remove the previously-injected REDIS_URL from the consumer.
+
+  vd redis:new-password <ref>
+      Rotate the redis password. Operator runs 'vd apply' next
+      to propagate to redis.conf, then 'vd redis:link' per
+      consumer to refresh URLs.
+
+  vd redis:info <ref>
+      Show connection info for a redis instance: URL, port,
+      data volume, password storage location.
+
+Per-command help:
+  vd redis:<command> -h
+
+The plugin is invoked by the controller; operators don't run
+this binary directly. See https://github.com/thadeu/voodu-redis
+for source.`)
 }
 
 // cmdExpand reads the operator's block spec from stdin, merges
