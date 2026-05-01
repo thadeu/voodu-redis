@@ -501,6 +501,14 @@ func (c *controllerClient) fetchSpec(kind, scope, name string) (map[string]any, 
 // merged config bucket as a string-typed map (REDIS_PASSWORD
 // is a string, etc.) wrapped as map[string]any so the URL
 // builder can use the same shape it expects from the spec.
+//
+// Wire shape on the controller side:
+//
+//	{"status":"ok","data":{"vars":{"KEY":"value", ...}}}
+//
+// We unwrap data.vars into a flat map. An empty bucket
+// surfaces as an empty map, not nil — caller can range it
+// safely.
 func (c *controllerClient) fetchConfig(scope, name string) (map[string]any, error) {
 	if c.baseURL == "" {
 		return nil, fmt.Errorf("no controller_url available")
@@ -524,15 +532,17 @@ func (c *controllerClient) fetchConfig(scope, name string) (map[string]any, erro
 	}
 
 	var env struct {
-		Data map[string]string `json:"data"`
+		Data struct {
+			Vars map[string]string `json:"vars"`
+		} `json:"data"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		return nil, fmt.Errorf("decode config response: %w", err)
 	}
 
-	out := make(map[string]any, len(env.Data))
-	for k, v := range env.Data {
+	out := make(map[string]any, len(env.Data.Vars))
+	for k, v := range env.Data.Vars {
 		out[k] = v
 	}
 

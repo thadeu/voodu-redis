@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -175,6 +178,89 @@ func TestBuildRedisURL_PriorityOrder(t *testing.T) {
 				t.Errorf("got  %q\nwant %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestFetchConfig_UnwrapsDataVars pins the wire-shape contract
+// with the controller's /config endpoint. Server emits
+// {"status":"ok","data":{"vars":{"K":"V"}}} — the plugin
+// must reach into data.vars to get the actual map. Earlier
+// implementations assumed data was the map directly, which
+// caused link to error with "cannot unmarshal object into
+// string" on real applies.
+func TestFetchConfig_UnwrapsDataVars(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/config" {
+			http.NotFound(w, r)
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data": map[string]any{
+				"vars": map[string]string{
+					"REDIS_PASSWORD": "secr3t",
+					"OTHER":          "x",
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	client := newControllerClient(srv.URL)
+
+	got, err := client.fetchConfig("clowk-lp", "redis")
+	if err != nil {
+		t.Fatalf("fetchConfig: %v", err)
+	}
+
+	if got["REDIS_PASSWORD"] != "secr3t" {
+		t.Errorf("REDIS_PASSWORD: got %v want secr3t", got["REDIS_PASSWORD"])
+	}
+
+	if got["OTHER"] != "x" {
+		t.Errorf("OTHER: got %v want x", got["OTHER"])
+	}
+}
+
+// TestFetchSpec_UnwrapsDataManifestSpec: /describe response
+// nests the spec under data.manifest.spec. Pin the unwrap so
+// a future controller refactor that moves spec around shows up
+// here, not as a runtime "missing image" error from the URL
+// builder.
+func TestFetchSpec_UnwrapsDataManifestSpec(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"data": map[string]any{
+				"manifest": map[string]any{
+					"kind":  "statefulset",
+					"scope": "clowk-lp",
+					"name":  "redis",
+					"spec": map[string]any{
+						"image": "redis:8",
+						"ports": []any{"6379"},
+					},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	client := newControllerClient(srv.URL)
+
+	got, err := client.fetchSpec("statefulset", "clowk-lp", "redis")
+	if err != nil {
+		t.Fatalf("fetchSpec: %v", err)
+	}
+
+	if got["image"] != "redis:8" {
+		t.Errorf("image: got %v want redis:8", got["image"])
+	}
+
+	ports, _ := got["ports"].([]any)
+	if len(ports) != 1 || ports[0] != "6379" {
+		t.Errorf("ports: got %v", ports)
 	}
 }
 
