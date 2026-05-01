@@ -58,6 +58,14 @@ type expandRequest struct {
 	Scope string          `json:"scope,omitempty"`
 	Name  string          `json:"name"`
 	Spec  json.RawMessage `json:"spec,omitempty"`
+
+	// Config is the merged config bucket the controller pre-
+	// fetched for (scope, name). Plugin uses this to read
+	// existing state — notably REDIS_PASSWORD on re-applies so
+	// the password stays stable across `vd apply` runs. Empty
+	// on first apply; plugin generates state then and emits a
+	// config_set action so the next apply sees it.
+	Config map[string]string `json:"config,omitempty"`
 }
 
 type envelope struct {
@@ -75,7 +83,7 @@ type manifest struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-redis <expand|--version>")
+		emitErr("usage: voodu-redis <expand|link|unlink|new-password|--version>")
 		os.Exit(1)
 	}
 
@@ -89,8 +97,26 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "link":
+		if err := cmdLink(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "unlink":
+		if err := cmdUnlink(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "new-password":
+		if err := cmdNewPassword(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -99,6 +125,21 @@ func main() {
 // it on top of plugin defaults, fetches the redis.conf via
 // `bin/get-conf` (a sibling script in the plugin dir), and
 // emits an [asset, statefulset] pair.
+//
+// Password lifecycle (idempotent across re-applies):
+//
+//   - Read REDIS_PASSWORD from req.Config (controller pre-fetched
+//     the merged bucket).
+//   - If present: reuse — append `requirepass <existing>` to the
+//     conf bytes. No action emitted (already stored).
+//   - If absent: generate a strong random password, append
+//     requirepass with the new value, AND emit a config_set
+//     action so the controller persists it. Subsequent expands
+//     see the persisted value and the password stays stable.
+//
+// This means the FIRST `vd apply` of a redis writes the password
+// once and every later apply replays the same bytes — the asset
+// digest doesn't churn unless something else changes.
 //
 // The subprocess call to get-conf is deliberate — it lets
 // operators substitute the script with a templated generator
@@ -138,13 +179,20 @@ func cmdExpand() error {
 
 	merged := mergeSpec(composeDefaults(req.Scope, req.Name), operatorSpec)
 
+	password, isNew, err := resolveOrGeneratePassword(req.Config)
+	if err != nil {
+		return fmt.Errorf("resolve password: %w", err)
+	}
+
+	confWithAuth := appendRequirepass(confBytes, password)
+
 	asset := manifest{
 		Kind:  "asset",
 		Scope: req.Scope,
 		Name:  req.Name,
 		Spec: map[string]any{
 			"files": map[string]any{
-				"redis_conf": string(confBytes),
+				"redis_conf": string(confWithAuth),
 			},
 		},
 	}
@@ -156,9 +204,38 @@ func cmdExpand() error {
 		Spec:  merged,
 	}
 
-	emitOK([]manifest{asset, statefulset})
+	out := expandedPayload{
+		Manifests: []manifest{asset, statefulset},
+	}
+
+	if isNew {
+		// Persist the freshly-generated password so later expands
+		// pick it up via Config and stay idempotent. Action lands
+		// on the same (scope, name) the redis itself uses; the
+		// dispatch endpoint pulls REDIS_PASSWORD from there
+		// when an operator runs `vd redis:link`.
+		out.Actions = []dispatchAction{
+			{
+				Type:  "config_set",
+				Scope: req.Scope,
+				Name:  req.Name,
+				KV:    map[string]string{"REDIS_PASSWORD": password},
+			},
+		}
+	}
+
+	emitOK(out)
 
 	return nil
+}
+
+// expandedPayload is the new envelope-data shape voodu-redis
+// emits. Compatible with the controller's decodeExpandedPayload
+// dispatcher: the {manifests, actions} object form is recognised
+// alongside the legacy array shape.
+type expandedPayload struct {
+	Manifests []manifest       `json:"manifests"`
+	Actions   []dispatchAction `json:"actions,omitempty"`
 }
 
 // readGeneratedConf invokes bin/get-conf in the plugin directory

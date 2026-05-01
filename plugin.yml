@@ -1,5 +1,5 @@
 name: redis
-version: 0.4.0
+version: 0.6.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
@@ -16,3 +16,23 @@ commands:
       Print the production-ready redis.conf this plugin ships.
       Operators can inspect, copy, or edit conf/redis.conf in
       place — stdout is the file the expand command embeds.
+  - name: link
+    help: >
+      Inject this redis's connection URL into a consumer's
+      config bucket. Usage:
+        vd redis:link <provider-scope/name> <consumer-scope/name>
+      Builds redis://default:<password>@<provider>.<scope>.voodu:<port>
+      using the password from `vd config get` then HCL env, sets
+      it as REDIS_URL on the consumer. Consumer auto-restarts.
+  - name: unlink
+    help: >
+      Remove the previously-injected REDIS_URL from a consumer's
+      config bucket. Symmetrical to `link`. Consumer auto-restarts.
+  - name: new-password
+    help: >
+      Rotate the redis password. Generates a strong random
+      password and stores it in the redis's config bucket
+      (REDIS_PASSWORD). Operator runs `vd apply` next to
+      propagate the new requirepass into redis.conf, then
+      `vd redis:link` per consumer to refresh REDIS_URL with
+      the new password.
