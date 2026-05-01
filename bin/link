@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Shim: the controller's plugin loader (plugins.LoadFromDir) indexes
+# subcommands by filename under bin/. Voodu-redis ships a single Go
+# binary with internal subcommand dispatch, so each user-facing
+# command needs a tiny wrapper here that re-execs the binary with
+# the right argv. Same shape as bin/expand and bin/get-conf.
+exec "$(dirname "$0")/voodu-redis" link "$@"
