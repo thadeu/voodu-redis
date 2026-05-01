@@ -166,9 +166,11 @@ Commands:
       refreshed with the new URL.
 
   vd redis:failover <ref> --to <ordinal>
-      Promote a specific replica ordinal to master. Operator
-      runs 'vd apply' next to roll the statefulset. Linked
-      consumers are auto-refreshed against the new master.
+      Promote a specific replica ordinal to master. One-shot —
+      flips REDIS_MASTER_ORDINAL, refreshes linked consumer URLs,
+      and rolls the statefulset top-down. No 'vd apply' step
+      needed; the new master is live once the rolling restart
+      finishes.
 
   vd redis:info <ref>
       Show connection info, replication topology, and linked

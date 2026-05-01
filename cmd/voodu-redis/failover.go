@@ -186,9 +186,14 @@ func cmdFailover() error {
 		refreshed++
 	}
 
+	// The controller's config_set fan-out re-fires the statefulset's
+	// apply, and the apply path's env-change branch rolls every pod
+	// top-down. So the operator-visible flow is one-shot: failover
+	// → URLs refreshed → pods restarting → new master live. No
+	// trailing `vd apply` needed.
 	msg := fmt.Sprintf(
-		"redis %s: master ordinal %d → %d. Run `vd apply` next to roll the statefulset; the wrapper script reads REDIS_MASTER_ORDINAL at boot, so pods need to restart.",
-		refOrName(scope, name), current, target,
+		"redis %s: master ordinal %d → %d. Pods are rolling top-down; the new master picks up reads/writes once ordinal-%d finishes restarting.",
+		refOrName(scope, name), current, target, target,
 	)
 
 	if refreshed > 0 {
@@ -248,23 +253,26 @@ func parseFailoverFlags(args []string) (positional []string, target int, hasTarg
 const failoverHelp = `Usage: vd redis:failover <scope/name> --to <ordinal>
 
 Promote a specific ordinal to master. Flips REDIS_MASTER_ORDINAL
-on the provider's config bucket and refreshes every linked
-consumer's URL so writes route to the new master.
+on the provider's config bucket, refreshes every linked consumer's
+URL, and rolls the statefulset top-down so the new master takes
+over. One-shot — no trailing ` + "`" + `vd apply` + "`" + ` needed.
 
-Sequence after the command runs:
+What happens:
 
-  1. Run ` + "`" + `vd apply` + "`" + ` to roll the statefulset. The wrapper
-     script reads REDIS_MASTER_ORDINAL at boot, so pods need
-     to restart for the role flip to take effect.
-  2. The old master comes back as a replica and re-syncs from
-     the new master. Writes that the old master held but never
-     replicated are LOST — async replication's documented
-     data-loss window.
+  1. REDIS_MASTER_ORDINAL on the provider's bucket flips to <ordinal>.
+  2. Every linked consumer's REDIS_URL re-emits against the new
+     master's per-pod FQDN. Apps auto-restart on env change.
+  3. The controller's config-change fan-out re-fires the statefulset's
+     apply. The apply's env-change branch rolls every pod top-down.
+     The wrapper script reads REDIS_MASTER_ORDINAL at boot and picks
+     the new role.
+  4. The old master comes back as a replica and re-syncs from the
+     new master. Writes the old master held but never replicated
+     are LOST — async replication's documented data-loss window.
 
 Operators wanting zero-loss failover should drain writes first
-(app maintenance mode), then run failover + apply, then resume
-traffic. Quorum-based graceful failover is the Sentinel feature
-in F3.
+(app maintenance mode), run the failover, then resume traffic.
+Quorum-based graceful failover is the Sentinel feature in F3.
 
 Examples:
   vd redis:failover clowk-lp/redis --to 1
