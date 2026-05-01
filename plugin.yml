@@ -1,5 +1,5 @@
 name: redis
-version: 0.8.0
+version: 0.9.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
@@ -35,9 +35,19 @@ commands:
       Rotate the redis password. Generates a strong random
       password and stores it in the redis's config bucket
       (REDIS_PASSWORD). Operator runs `vd apply` next to
-      propagate the new requirepass into redis.conf, then
-      `vd redis:link` per consumer to refresh REDIS_URL with
-      the new password.
+      propagate the new requirepass into redis.conf; linked
+      consumers are auto-refreshed with the new URL.
+  - name: failover
+    help: >
+      Promote a specific replica ordinal to master. Usage:
+        vd redis:failover <scope/name> --to <ordinal>
+      Flips REDIS_MASTER_ORDINAL on the provider's bucket and
+      refreshes every linked consumer's URL so writes route
+      to the new master. Operator runs `vd apply` next to
+      roll the statefulset; the wrapper script reads
+      REDIS_MASTER_ORDINAL at boot. Manual failover only —
+      automatic graceful failover is the Sentinel feature
+      in F3.
   - name: info
     help: >
       Show connection info for a redis instance: URL (redacted),

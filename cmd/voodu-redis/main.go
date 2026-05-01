@@ -83,7 +83,7 @@ type manifest struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-redis <expand|link|unlink|new-password|info|help|--version>")
+		emitErr("usage: voodu-redis <expand|link|unlink|new-password|failover|info|help|--version>")
 		os.Exit(1)
 	}
 
@@ -115,6 +115,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "failover":
+		if err := cmdFailover(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	case "info":
 		if err := cmdInfo(); err != nil {
 			emitErr(err.Error())
@@ -129,7 +135,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|failover|info|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -156,12 +162,17 @@ Commands:
 
   vd redis:new-password <ref>
       Rotate the redis password. Operator runs 'vd apply' next
-      to propagate to redis.conf, then 'vd redis:link' per
-      consumer to refresh URLs.
+      to propagate to redis.conf. Linked consumers are auto-
+      refreshed with the new URL.
+
+  vd redis:failover <ref> --to <ordinal>
+      Promote a specific replica ordinal to master. Operator
+      runs 'vd apply' next to roll the statefulset. Linked
+      consumers are auto-refreshed against the new master.
 
   vd redis:info <ref>
-      Show connection info for a redis instance: URL, port,
-      data volume, password storage location.
+      Show connection info, replication topology, and linked
+      consumer list for a redis instance.
 
 Per-command help:
   vd redis:<command> -h
