@@ -100,17 +100,24 @@ func TestResolveOrGeneratePassword_TreatsEmptyAsAbsent(t *testing.T) {
 	}
 }
 
-// TestAppendRequirepass_AppendedToEnd: the directive lands as
-// the LAST line so redis's "last wins" override semantics make
-// it authoritative even if the upstream conf already had one.
+// TestAppendRequirepass_AppendedToEnd: the directives land at
+// the END of the conf so redis's "last wins" override semantics
+// make them authoritative even if the upstream conf already had
+// requirepass or masterauth set. Both directives are emitted —
+// requirepass for client auth, masterauth for replica → master
+// authentication after PSYNC.
 func TestAppendRequirepass_AppendedToEnd(t *testing.T) {
 	conf := []byte("port 6379\nbind 0.0.0.0\n")
 	out := appendRequirepass(conf, "secret123")
 
 	s := string(out)
 
-	if !strings.HasSuffix(s, "requirepass secret123\n") {
-		t.Errorf("requirepass should be the last line:\n%s", s)
+	if !strings.HasSuffix(s, "masterauth secret123\n") {
+		t.Errorf("masterauth should be the last line:\n%s", s)
+	}
+
+	if !strings.Contains(s, "\nrequirepass secret123\n") {
+		t.Errorf("requirepass directive missing or on a wrong line:\n%s", s)
 	}
 
 	// The original directives must remain.
@@ -126,7 +133,7 @@ func TestAppendRequirepass_AppendedToEnd(t *testing.T) {
 
 // TestAppendRequirepass_HandlesMissingTrailingNewline: some
 // get-conf scripts forget the final \n. The helper inserts one
-// before the directive so we don't accidentally produce
+// before the directives so we don't accidentally produce
 // `bind 0.0.0.0requirepass …` on the same line.
 func TestAppendRequirepass_HandlesMissingTrailingNewline(t *testing.T) {
 	conf := []byte("port 6379\nbind 0.0.0.0") // no trailing newline
@@ -138,8 +145,32 @@ func TestAppendRequirepass_HandlesMissingTrailingNewline(t *testing.T) {
 		t.Errorf("requirepass should be on its own line:\n%s", s)
 	}
 
-	if !strings.HasSuffix(s, "requirepass x\n") {
-		t.Errorf("should still end with the directive:\n%s", s)
+	if !strings.HasSuffix(s, "masterauth x\n") {
+		t.Errorf("should still end with the masterauth directive:\n%s", s)
+	}
+
+	if !strings.Contains(s, "\nrequirepass x\n") {
+		t.Errorf("requirepass directive missing:\n%s", s)
+	}
+}
+
+// TestAppendRequirepass_BothDirectivesUseSamePassword pins the
+// invariant that requirepass and masterauth ALWAYS carry the
+// same value. Different values would mean a replica fails to
+// auth against the master after PSYNC, breaking replication
+// silently. The plugin's contract is single-password — operators
+// rotating via vd redis:new-password get one new password
+// applied to both directives in lock-step.
+func TestAppendRequirepass_BothDirectivesUseSamePassword(t *testing.T) {
+	out := appendRequirepass([]byte("port 6379\n"), "shared-secret")
+	s := string(out)
+
+	if !strings.Contains(s, "requirepass shared-secret") {
+		t.Errorf("requirepass missing:\n%s", s)
+	}
+
+	if !strings.Contains(s, "masterauth shared-secret") {
+		t.Errorf("masterauth missing:\n%s", s)
 	}
 }
 

@@ -1,8 +1,10 @@
 name: redis
-version: 0.7.5
+version: 0.8.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
+  Replication-aware: replicas > 1 spawns 1 master + N-1 read replicas
+  with async TCP replication, AOF persistence, and per-pod volumes.
 homepage: https://github.com/thadeu/voodu-redis
 
 commands:

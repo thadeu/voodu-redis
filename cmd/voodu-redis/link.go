@@ -60,17 +60,56 @@ type dispatchAction struct {
 // node-redis, redis-py, ioredis, go-redis all check first).
 const consumerEnvVar = "REDIS_URL"
 
+// consumerReadEnvVar is the read-pool URL emitted alongside
+// REDIS_URL when the provider has replicas > 1 and the consumer
+// did NOT pass --reads. The convention matches Sidekiq's
+// REDIS_PROVIDER + REDIS_READ_URL pattern, picked up by Rails
+// 6+ replica-aware connection pooling.
+const consumerReadEnvVar = "REDIS_READ_URL"
+
+// linkedConsumersKey is the config-bucket key on the provider
+// (the redis itself) that lists every consumer currently linked
+// to it. Comma-separated `scope/name` refs. Maintained by
+// cmdLink (add) and cmdUnlink (remove); used by cmdNewPassword
+// to auto-refresh every linked consumer's URL with the new
+// password without the operator manually re-running link.
+//
+// Unscoped consumers ride as `/<name>` (leading slash) so the
+// parser can recover both halves from the comma-split.
+const linkedConsumersKey = "REDIS_LINKED_CONSUMERS"
+
 // cmdLink wires a redis provider to a consumer.
 //
-// Args (os.Args[2:]):
+// Args (os.Args[2:], flags interleaved):
 //
-//	[0] provider scope/name (e.g. "clowk-lp/redis")
-//	[1] consumer scope/name (e.g. "clowk-lp/web")
+//	[positional 0] provider scope/name (e.g. "clowk-lp/redis")
+//	[positional 1] consumer scope/name (e.g. "clowk-lp/web")
+//	--reads        consumer is read-only; emit a single
+//	               REDIS_URL pointing at the round-robin
+//	               shared alias instead of the master+read
+//	               split.
 //
 // Reads invocation context from stdin to find controller_url,
 // then calls /describe and /config to gather the provider's
-// state. Builds redis://default:<password>@<host>:<port> and
-// emits a config_set action on the consumer.
+// state. Builds the URL(s) and emits config_set actions on the
+// consumer (the URL injection) plus on the provider (linked-
+// consumers tracking, for password rotation auto-refresh).
+//
+// URL emission logic:
+//
+//   - replicas <= 1: single REDIS_URL pointing at the shared
+//     alias (`<name>.<scope>.voodu`). Pre-M2 behaviour.
+//
+//   - replicas > 1, no --reads: REDIS_URL pins the master
+//     (`<name>-0.<scope>.voodu` — pod-0 by convention),
+//     REDIS_READ_URL points at the round-robin shared alias.
+//     Apps using the dual-URL pattern (Rails replica-aware
+//     pools, custom Sidekiq fan-out) read from the pool and
+//     write to the master.
+//
+//   - replicas > 1, --reads: ONE REDIS_URL on the round-robin
+//     pool. Use this for read-heavy consumers that shouldn't
+//     have a separate read URL (caching workers, dashboards).
 //
 // `-h` / `--help` short-circuits the network calls and prints
 // usage on stdout for the operator.
@@ -82,12 +121,14 @@ func cmdLink() error {
 		return nil
 	}
 
-	if len(args) < 2 {
-		return fmt.Errorf("usage: vd redis:link <provider-scope/name> <consumer-scope/name>")
+	positional, readsOnly := parseLinkFlags(args)
+
+	if len(positional) < 2 {
+		return fmt.Errorf("usage: vd redis:link [--reads] <provider-scope/name> <consumer-scope/name>")
 	}
 
-	providerRef := args[0]
-	consumerRef := args[1]
+	providerRef := positional[0]
+	consumerRef := positional[1]
 
 	provScope, provName := splitScopeName(providerRef)
 	consScope, consName := splitScopeName(consumerRef)
@@ -119,36 +160,322 @@ func cmdLink() error {
 		return fmt.Errorf("config get %s: %w", providerRef, err)
 	}
 
-	connURL, err := buildRedisURL(provScope, provName, spec, config)
-	if err != nil {
-		return fmt.Errorf("build url: %w", err)
+	urls := buildLinkURLs(provScope, provName, spec, config, readsOnly)
+
+	consumerKV := map[string]string{consumerEnvVar: urls.WriteURL}
+
+	if urls.ReadURL != "" {
+		consumerKV[consumerReadEnvVar] = urls.ReadURL
 	}
 
-	out := dispatchOutput{
-		Message: fmt.Sprintf("linked %s → %s (%s)",
-			refOrName(provScope, provName),
-			refOrName(consScope, consName),
-			consumerEnvVar),
-		Actions: []dispatchAction{
-			{
-				Type:  "config_set",
-				Scope: consScope,
-				Name:  consName,
-				KV:    map[string]string{consumerEnvVar: connURL},
-			},
+	actions := []dispatchAction{
+		{
+			Type:  "config_set",
+			Scope: consScope,
+			Name:  consName,
+			KV:    consumerKV,
 		},
+	}
+
+	// Track the consumer on the provider's bucket so cmdNewPassword
+	// can auto-refresh every linked consumer when the password
+	// rotates. Idempotent on re-link (consumer already in the
+	// list — no-op write of the same value).
+	updatedList := addLinkedConsumer(config, consScope, consName)
+
+	actions = append(actions, dispatchAction{
+		Type:  "config_set",
+		Scope: provScope,
+		Name:  provName,
+		KV:    map[string]string{linkedConsumersKey: updatedList},
+	})
+
+	out := dispatchOutput{
+		Message: linkedMessage(provScope, provName, consScope, consName, urls, readsOnly),
+		Actions: actions,
 	}
 
 	return writeDispatchOutput(out)
 }
 
-// cmdUnlink emits a config_unset action on the consumer.
-// Doesn't require provider state — just the consumer ref.
+// parseLinkFlags is a tiny argv parser for cmdLink and
+// cmdUnlink. Recognises a single boolean flag --reads and
+// returns the rest as positional args. Order-agnostic: the
+// flag may appear before, between, or after the positional
+// args. Stop-at-`--` would be standard CLI courtesy but the
+// command grammar is too small to need it.
+//
+// Mirrors Go's flag package for the simplest case; we don't
+// import flag because the CLI's pass-through has already
+// stripped any `vd`-level flags by the time argv reaches the
+// plugin, and a custom 10-line parser is easier to reason
+// about than configuring flag.NewFlagSet with a custom Usage.
+func parseLinkFlags(args []string) (positional []string, readsOnly bool) {
+	positional = make([]string, 0, len(args))
+
+	for _, a := range args {
+		if a == "--reads" {
+			readsOnly = true
+			continue
+		}
+
+		positional = append(positional, a)
+	}
+
+	return positional, readsOnly
+}
+
+// linkURLs is the small bag of URLs cmdLink emits onto the
+// consumer's config bucket. WriteURL is always set; ReadURL
+// is populated only when the provider has replicas > 1 AND
+// the operator did NOT pass --reads.
+type linkURLs struct {
+	WriteURL string
+	ReadURL  string
+}
+
+// buildLinkURLs is the single source of truth for the URL-emission
+// matrix described on cmdLink. Splitting it out lets cmdNewPassword
+// rebuild URLs for every linked consumer with the same logic the
+// operator's original `vd redis:link` invocation used, without
+// having to re-derive replicas/--reads on the rotation path.
+//
+// `--reads` is not stored anywhere (it lives on the operator's
+// invocation, not the provider's spec), so cmdNewPassword can
+// only know about it indirectly: a consumer linked with --reads
+// today gets the same `--reads`-shaped URL on re-link tomorrow.
+// We re-emit BOTH variants in the rotation path and let the
+// consumer's existing config bucket dictate which one applies
+// (ReadURL only set if it was set before — see refresh logic
+// in cmdNewPassword).
+func buildLinkURLs(scope, name string, spec, config map[string]any, readsOnly bool) linkURLs {
+	password := redisPasswordFromConfig(config)
+	if password == "" {
+		password = redisPasswordFromSpecEnv(spec)
+	}
+
+	port := redisPort(spec)
+
+	sharedHost := redisHost(scope, name)
+	masterHost := redisMasterHost(scope, name, redisMasterOrdinal(config))
+
+	replicas := redisReplicas(spec)
+
+	// Single-pod or operator wants reads-only flat: just the
+	// shared alias. Round-robin doesn't matter when there's
+	// only one pod, but it produces the same URL the pre-M2
+	// plugin emitted, so existing apps see no change.
+	if replicas <= 1 || readsOnly {
+		return linkURLs{
+			WriteURL: composeURL(password, sharedHost, port),
+		}
+	}
+
+	// Multi-replica + writer consumer: pin writes to the master,
+	// fan out reads to the round-robin pool.
+	return linkURLs{
+		WriteURL: composeURL(password, masterHost, port),
+		ReadURL:  composeURL(password, sharedHost, port),
+	}
+}
+
+// composeURL builds the canonical redis:// URL. Password may be
+// empty (no auth — emits redis://host:port verbatim).
+func composeURL(password, host string, port int) string {
+	u := &url.URL{
+		Scheme: "redis",
+		Host:   fmt.Sprintf("%s:%d", host, port),
+	}
+
+	if password != "" {
+		u.User = url.UserPassword("default", password)
+	}
+
+	return u.String()
+}
+
+// redisMasterHost is the per-pod FQDN voodu0 resolves to a
+// specific ordinal (`<name>-<n>.<scope>.voodu`). With M2
+// replication, ordinal-0 is the master by convention; ordinal-N
+// is replica N. Failover (M2.2) flips this via REDIS_MASTER_ORDINAL
+// in the provider's config bucket.
+func redisMasterHost(scope, name string, masterOrdinal int) string {
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	name = strings.ToLower(strings.TrimSpace(name))
+
+	pod := fmt.Sprintf("%s-%d", name, masterOrdinal)
+
+	if scope == "" {
+		return pod + ".voodu"
+	}
+
+	return pod + "." + scope + ".voodu"
+}
+
+// redisMasterOrdinal reads REDIS_MASTER_ORDINAL from the
+// provider's config bucket. Defaults to 0 (pod-0 = master) on
+// missing / unparseable values — matches the wrapper script's
+// fallback so URL emission and the entrypoint always agree on
+// who the master is.
+func redisMasterOrdinal(config map[string]any) int {
+	if config == nil {
+		return 0
+	}
+
+	raw, ok := config["REDIS_MASTER_ORDINAL"].(string)
+	if !ok || raw == "" {
+		return 0
+	}
+
+	var n int
+
+	if _, err := fmt.Sscanf(raw, "%d", &n); err != nil || n < 0 {
+		return 0
+	}
+
+	return n
+}
+
+// redisReplicas extracts the declared replica count from the
+// statefulset spec. Plugin-side default is 1; the controller
+// also clamps to 1 in statefulsetReplicas, so the value here
+// matches the actual pod count.
+func redisReplicas(spec map[string]any) int {
+	if spec == nil {
+		return 1
+	}
+
+	switch r := spec["replicas"].(type) {
+	case float64:
+		if r < 1 {
+			return 1
+		}
+
+		return int(r)
+	case int:
+		if r < 1 {
+			return 1
+		}
+
+		return r
+	}
+
+	return 1
+}
+
+// linkedMessage builds the operator-facing one-liner cmdLink
+// emits. Branching on URL shape so the operator immediately
+// sees whether they're in dual-URL mode or single-URL mode —
+// useful for catching a wrong --reads invocation.
+func linkedMessage(provScope, provName, consScope, consName string, urls linkURLs, readsOnly bool) string {
+	if urls.ReadURL == "" {
+		mode := "single-pod"
+		if readsOnly {
+			mode = "reads-only"
+		}
+
+		return fmt.Sprintf("linked %s → %s (%s, %s)",
+			refOrName(provScope, provName),
+			refOrName(consScope, consName),
+			consumerEnvVar,
+			mode)
+	}
+
+	return fmt.Sprintf("linked %s → %s (%s + %s, master at ordinal-0)",
+		refOrName(provScope, provName),
+		refOrName(consScope, consName),
+		consumerEnvVar,
+		consumerReadEnvVar)
+}
+
+// addLinkedConsumer appends a consumer ref to the provider's
+// REDIS_LINKED_CONSUMERS list, deduped. Returns the new
+// comma-joined value ready for a config_set action. Empty
+// initial state produces a single-entry list.
+func addLinkedConsumer(config map[string]any, scope, name string) string {
+	ref := refOrName(scope, name)
+
+	existing := parseLinkedConsumers(config)
+
+	for _, e := range existing {
+		if e == ref {
+			// Already linked — re-emit the same list verbatim.
+			return strings.Join(existing, ",")
+		}
+	}
+
+	existing = append(existing, ref)
+
+	return strings.Join(existing, ",")
+}
+
+// removeLinkedConsumer drops a consumer ref from the provider's
+// REDIS_LINKED_CONSUMERS list, returning the new comma-joined
+// value. Idempotent — removing a ref that isn't there is a
+// no-op (returns the original list).
+func removeLinkedConsumer(config map[string]any, scope, name string) string {
+	ref := refOrName(scope, name)
+
+	existing := parseLinkedConsumers(config)
+
+	out := existing[:0]
+
+	for _, e := range existing {
+		if e == ref {
+			continue
+		}
+
+		out = append(out, e)
+	}
+
+	return strings.Join(out, ",")
+}
+
+// parseLinkedConsumers decodes the comma-separated list. Empty
+// values from a missing key, empty string, or stray ","
+// collapse to nil so the slice is range-safe without a length
+// check at every call site.
+func parseLinkedConsumers(config map[string]any) []string {
+	if config == nil {
+		return nil
+	}
+
+	raw, ok := config[linkedConsumersKey].(string)
+	if !ok || raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+
+	out := make([]string, 0, len(parts))
+
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+
+		out = append(out, p)
+	}
+
+	return out
+}
+
+// cmdUnlink emits a config_unset action on the consumer plus
+// (when the controller URL is reachable) a config_set on the
+// provider to drop this consumer from REDIS_LINKED_CONSUMERS.
+// The provider-side update is best-effort — if the controller
+// is unreachable, the consumer is still cleared.
 //
 // Args (os.Args[2:]):
 //
-//	[0] (ignored, kept for symmetry with link) provider ref
+//	[0] provider scope/name (used for linked-consumers tracking)
 //	[1] consumer scope/name to clear
+//
+// Both URLs (REDIS_URL and REDIS_READ_URL) are unset on the
+// consumer, even if it was a single-URL link — config_unset
+// is a no-op on missing keys, so it's safe to clear both
+// every time.
 func cmdUnlink() error {
 	args := os.Args[2:]
 
@@ -161,38 +488,95 @@ func cmdUnlink() error {
 		return fmt.Errorf("usage: vd redis:unlink <provider-scope/name> <consumer-scope/name>")
 	}
 
+	provScope, provName := splitScopeName(args[0])
 	consScope, consName := splitScopeName(args[1])
+
+	if provName == "" {
+		return fmt.Errorf("invalid provider ref %q (expected scope/name)", args[0])
+	}
+
 	if consName == "" {
 		return fmt.Errorf("invalid consumer ref %q (expected scope/name)", args[1])
 	}
 
-	out := dispatchOutput{
-		Message: fmt.Sprintf("unlinked %s (%s removed)",
-			refOrName(consScope, consName),
-			consumerEnvVar),
-		Actions: []dispatchAction{
-			{
-				Type:  "config_unset",
-				Scope: consScope,
-				Name:  consName,
-				Keys:  []string{consumerEnvVar},
-			},
+	actions := []dispatchAction{
+		{
+			Type:  "config_unset",
+			Scope: consScope,
+			Name:  consName,
+			Keys:  []string{consumerEnvVar, consumerReadEnvVar},
 		},
+	}
+
+	// Best-effort: fetch provider config to update the linked-
+	// consumers list. A controller fetch failure here drops the
+	// list update — the consumer side still gets cleared, which
+	// is the operator-visible side of unlink.
+	ctx, err := readInvocationContext()
+	if err == nil {
+		client := newControllerClient(ctx.ControllerURL)
+
+		if config, ferr := client.fetchConfig(provScope, provName); ferr == nil {
+			updated := removeLinkedConsumer(config, consScope, consName)
+
+			if updated == "" {
+				// Empty list — drop the key entirely so a
+				// `vd config get redis_provider` doesn't
+				// surface a confusing empty value.
+				actions = append(actions, dispatchAction{
+					Type:  "config_unset",
+					Scope: provScope,
+					Name:  provName,
+					Keys:  []string{linkedConsumersKey},
+				})
+			} else {
+				actions = append(actions, dispatchAction{
+					Type:  "config_set",
+					Scope: provScope,
+					Name:  provName,
+					KV:    map[string]string{linkedConsumersKey: updated},
+				})
+			}
+		}
+	}
+
+	out := dispatchOutput{
+		Message: fmt.Sprintf("unlinked %s (%s, %s removed)",
+			refOrName(consScope, consName),
+			consumerEnvVar,
+			consumerReadEnvVar),
+		Actions: actions,
 	}
 
 	return writeDispatchOutput(out)
 }
 
-// cmdNewPassword rotates the redis password.
+// cmdNewPassword rotates the redis password and AUTOMATICALLY
+// refreshes every linked consumer's URL with the new value.
 //
 // Args (os.Args[2:]):
 //
 //	[0] target scope/name (the redis to rotate)
 //
-// Generates a fresh random password, emits a config_set action
-// on the redis itself. Operator runs `vd apply` next to
-// propagate to redis.conf, then `vd redis:link` per consumer
-// to refresh URLs.
+// Sequence:
+//
+//  1. Generate a fresh random password.
+//  2. Fetch the provider's config bucket to read
+//     REDIS_LINKED_CONSUMERS (the list maintained by cmdLink/
+//     cmdUnlink) and the current spec (port, replicas — drives
+//     the URL shape).
+//  3. Emit a config_set on the provider with the new password.
+//  4. For each linked consumer, emit a config_set with refreshed
+//     URLs. Each consumer's existing config bucket is fetched to
+//     decide whether to re-emit REDIS_READ_URL: if it had one
+//     before, keep it (replicas > 1, default link); if it didn't,
+//     stay single-URL (--reads or replicas <= 1 originally).
+//
+// The operator still needs `vd apply` to propagate the new
+// password into redis.conf — config_set on REDIS_PASSWORD is
+// the data side; the asset re-render that bakes it into the
+// running redis.conf only happens on apply. The auto-refresh
+// here means consumers don't have to be manually re-linked.
 func cmdNewPassword() error {
 	args := os.Args[2:]
 
@@ -215,17 +599,89 @@ func cmdNewPassword() error {
 		return fmt.Errorf("generate: %w", err)
 	}
 
-	out := dispatchOutput{
-		Message: fmt.Sprintf("rotated REDIS_PASSWORD for %s — run `vd apply` to refresh redis.conf, then `vd redis:link` per consumer to refresh URLs",
-			refOrName(scope, name)),
-		Actions: []dispatchAction{
-			{
-				Type:  "config_set",
-				Scope: scope,
-				Name:  name,
-				KV:    map[string]string{passwordKey: fresh},
-			},
+	actions := []dispatchAction{
+		{
+			Type:  "config_set",
+			Scope: scope,
+			Name:  name,
+			KV:    map[string]string{passwordKey: fresh},
 		},
+	}
+
+	// Best-effort consumer refresh. If the controller is
+	// unreachable, fall back to the pre-M2 manual flow:
+	// operator runs `vd redis:link` per consumer themselves.
+	refreshed := 0
+
+	ctx, err := readInvocationContext()
+	if err == nil && ctx.ControllerURL != "" {
+		client := newControllerClient(ctx.ControllerURL)
+
+		spec, _ := client.fetchSpec("statefulset", scope, name)
+
+		// Build a synthetic config map carrying the NEW password
+		// (we haven't applied yet, so the controller's bucket
+		// still has the old one). The URL builder reads
+		// REDIS_PASSWORD from the config map argument; this
+		// shortcut keeps the URL emission logic identical between
+		// link-time and rotate-time without a special-case branch.
+		providerConfig, _ := client.fetchConfig(scope, name)
+
+		freshConfig := make(map[string]any, len(providerConfig)+1)
+
+		for k, v := range providerConfig {
+			freshConfig[k] = v
+		}
+
+		freshConfig[passwordKey] = fresh
+
+		consumers := parseLinkedConsumers(providerConfig)
+
+		for _, ref := range consumers {
+			cScope, cName := splitScopeName(ref)
+			if cName == "" {
+				continue
+			}
+
+			// Determine whether THIS consumer was originally
+			// linked with --reads (single URL) by inspecting
+			// the existing config bucket on the consumer side.
+			// Presence of REDIS_READ_URL → dual-URL link;
+			// absence → single-URL (--reads or replicas <= 1).
+			consumerCfg, _ := client.fetchConfig(cScope, cName)
+
+			_, hadRead := consumerCfg[consumerReadEnvVar]
+
+			urls := buildLinkURLs(scope, name, spec, freshConfig, !hadRead)
+
+			kv := map[string]string{consumerEnvVar: urls.WriteURL}
+
+			if urls.ReadURL != "" {
+				kv[consumerReadEnvVar] = urls.ReadURL
+			}
+
+			actions = append(actions, dispatchAction{
+				Type:  "config_set",
+				Scope: cScope,
+				Name:  cName,
+				KV:    kv,
+			})
+
+			refreshed++
+		}
+	}
+
+	msg := fmt.Sprintf("rotated REDIS_PASSWORD for %s — run `vd apply` to refresh redis.conf",
+		refOrName(scope, name))
+
+	if refreshed > 0 {
+		msg = fmt.Sprintf("%s; auto-refreshed %d linked consumer(s) with the new URL",
+			msg, refreshed)
+	}
+
+	out := dispatchOutput{
+		Message: msg,
+		Actions: actions,
 	}
 
 	return writeDispatchOutput(out)
@@ -235,18 +691,35 @@ func cmdNewPassword() error {
 // os.Args. The plugin owns its own help; the CLI is a dumb
 // pass-through that doesn't intercept these flags.
 const (
-	linkHelp = `Usage: vd redis:link <provider-scope/name> <consumer-scope/name>
+	linkHelp = `Usage: vd redis:link [--reads] <provider-scope/name> <consumer-scope/name>
 
 Inject the redis provider's connection URL into the consumer's
 config bucket. The consumer auto-restarts to pick up the new env.
 
-Example:
-  vd redis:link clowk-lp/redis clowk-lp/web`
+URLs emitted:
+
+  replicas = 1
+    REDIS_URL = redis://default:<pw>@<name>.<scope>.voodu:6379
+
+  replicas > 1, no --reads
+    REDIS_URL      = redis://default:<pw>@<name>-0.<scope>.voodu:6379  (master)
+    REDIS_READ_URL = redis://default:<pw>@<name>.<scope>.voodu:6379    (round-robin)
+
+  replicas > 1, --reads
+    REDIS_URL      = redis://default:<pw>@<name>.<scope>.voodu:6379    (round-robin only)
+
+The provider tracks linked consumers in REDIS_LINKED_CONSUMERS
+so 'vd redis:new-password' auto-refreshes every consumer URL.
+
+Examples:
+  vd redis:link clowk-lp/redis clowk-lp/web
+  vd redis:link --reads clowk-lp/redis clowk-lp/dashboard`
 
 	unlinkHelp = `Usage: vd redis:unlink <provider-scope/name> <consumer-scope/name>
 
-Remove the previously-injected REDIS_URL from the consumer's
-config bucket. Consumer auto-restarts.
+Remove REDIS_URL and REDIS_READ_URL from the consumer's config
+bucket and drop the consumer from the provider's linked-consumers
+list. Consumer auto-restarts.
 
 Example:
   vd redis:unlink clowk-lp/redis clowk-lp/web`
@@ -254,10 +727,11 @@ Example:
 	newPasswordHelp = `Usage: vd redis:new-password <scope/name>
 
 Rotate the redis password. Generates a fresh 256-bit random
-password and stores it in the redis's config bucket. Operator
-runs 'vd apply' next to propagate to redis.conf (asset re-
-materialise → rolling restart), then 'vd redis:link' for each
-consumer that needs the new URL.
+password and stores it in the redis's config bucket, then
+auto-refreshes every linked consumer's URL with the new password.
+Operator runs 'vd apply' next to propagate the password into
+redis.conf (asset re-materialise → rolling restart). Consumers
+pick up the new URL on their auto-restart.
 
 Example:
   vd redis:new-password clowk-lp/redis`
@@ -282,25 +756,22 @@ func hasHelpFlag(args []string) bool {
 //  1. config["REDIS_PASSWORD"] (operator's `vd config set`)
 //  2. spec.env["REDIS_PASSWORD"] (operator's HCL env block)
 //  3. None — emit no-auth URL
+//
+// Always returns the round-robin shared-alias URL (the
+// pre-M2 default). Used by `vd redis:info` for the displayed
+// connection URL — operator-facing one-liner that doesn't
+// need to break out master vs read pools. cmdLink calls
+// buildLinkURLs directly to get the dual-URL shape.
 func buildRedisURL(scope, name string, spec, config map[string]any) (string, error) {
-	host := redisHost(scope, name)
-	port := redisPort(spec)
-
 	password := redisPasswordFromConfig(config)
 	if password == "" {
 		password = redisPasswordFromSpecEnv(spec)
 	}
 
-	u := &url.URL{
-		Scheme: "redis",
-		Host:   fmt.Sprintf("%s:%d", host, port),
-	}
+	host := redisHost(scope, name)
+	port := redisPort(spec)
 
-	if password != "" {
-		u.User = url.UserPassword("default", password)
-	}
-
-	return u.String(), nil
+	return composeURL(password, host, port), nil
 }
 
 // redisHost is the voodu0 FQDN: `<name>.<scope>.voodu` (or

@@ -78,6 +78,9 @@ func cmdInfo() error {
 		image = "(default — see voodu-redis composeDefaults)"
 	}
 
+	replicas := redisReplicas(spec)
+	masterOrd := redisMasterOrdinal(config)
+
 	out := strings.Builder{}
 
 	fmt.Fprintf(&out, "redis/%s\n\n", refOrName(scope, name))
@@ -87,6 +90,40 @@ func cmdInfo() error {
 	fmt.Fprintf(&out, "  port:            %d\n", port)
 	fmt.Fprintf(&out, "  data volume:     %s\n", dataVolume)
 	fmt.Fprintln(&out)
+
+	// Topology section — replicas, master role, per-pod FQDNs
+	// so the operator can run `redis-cli -h <pod>.<scope>.voodu`
+	// against a specific replica without guessing the alias
+	// shape.
+	fmt.Fprintf(&out, "topology:\n")
+	fmt.Fprintf(&out, "  replicas:        %d\n", replicas)
+
+	if replicas == 1 {
+		fmt.Fprintf(&out, "  role:            single-pod (no replication)\n")
+	} else {
+		fmt.Fprintf(&out, "  master ordinal:  %d (REDIS_MASTER_ORDINAL)\n", masterOrd)
+		fmt.Fprintf(&out, "  master host:     %s\n", redisMasterHost(scope, name, masterOrd))
+
+		fmt.Fprintf(&out, "  replica hosts:   ")
+
+		first := true
+		for n := 0; n < replicas; n++ {
+			if n == masterOrd {
+				continue
+			}
+
+			if !first {
+				fmt.Fprintf(&out, ", ")
+			}
+
+			fmt.Fprintf(&out, "%s", redisMasterHost(scope, name, n))
+			first = false
+		}
+
+		fmt.Fprintln(&out)
+	}
+
+	fmt.Fprintln(&out)
 	fmt.Fprintf(&out, "connect:\n")
 	// Connection URL is shown verbatim (with the password) so
 	// operator gets a copy/paste-ready string for the redis-cli
@@ -95,6 +132,25 @@ func cmdInfo() error {
 	// 's/:[^@]*@/:****@/'` on their side; the plugin opts for
 	// utility over caution by default.
 	fmt.Fprintf(&out, "  url:             %s\n", connURL)
+
+	// Linked consumers: surface the list maintained by
+	// cmdLink/cmdUnlink so the operator can see "what breaks if
+	// I rotate the password" at a glance. Empty list is shown
+	// explicitly rather than omitted — better signal than an
+	// absent section ("none yet" vs "feature missing").
+	consumers := parseLinkedConsumers(config)
+
+	fmt.Fprintln(&out)
+	fmt.Fprintf(&out, "linked consumers (REDIS_LINKED_CONSUMERS):\n")
+
+	if len(consumers) == 0 {
+		fmt.Fprintf(&out, "  (none — run `vd redis:link %s/%s <consumer>` to add one)\n",
+			scope, name)
+	} else {
+		for _, c := range consumers {
+			fmt.Fprintf(&out, "  - %s\n", c)
+		}
+	}
 
 	// Plain text on stdout — no envelope. Operator wants to
 	// read this, not parse JSON. Server passes it through as

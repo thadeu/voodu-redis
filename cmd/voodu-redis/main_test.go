@@ -268,8 +268,9 @@ func TestMergeSpec_OperatorWinsForUntypedKeys(t *testing.T) {
 
 // TestMergeSpec_VolumesAdditiveOnRedisBlock simulates the user's
 // real scenario: the operator declares an asset volume and
-// expects both the plugin's redis.conf AND their addition to
-// land in the final list.
+// expects both the plugin's defaults (redis.conf bind AND the
+// entrypoint wrapper bind, post-M2) AND their addition to land
+// in the final list.
 func TestMergeSpec_VolumesAdditiveOnRedisBlock(t *testing.T) {
 	defaults := composeDefaults("clowk-lp", "redis")
 
@@ -286,12 +287,13 @@ func TestMergeSpec_VolumesAdditiveOnRedisBlock(t *testing.T) {
 		t.Fatalf("volumes not a list: %T", got["volumes"])
 	}
 
-	if len(vols) != 2 {
-		t.Errorf("expected 2 volumes (plugin default + operator add), got %d: %v", len(vols), vols)
+	if len(vols) != 3 {
+		t.Errorf("expected 3 volumes (redis.conf + entrypoint + operator add), got %d: %v", len(vols), vols)
 	}
 
 	want := []any{
 		"${asset.clowk-lp.redis.redis_conf}:/etc/redis/redis.conf:ro",
+		"${asset.clowk-lp.redis.entrypoint}:/usr/local/bin/voodu-redis-entrypoint:ro",
 		"${asset.clowk-lp.cdn.acls}:/etc/redis/users.acl:ro",
 	}
 
@@ -315,25 +317,27 @@ func TestComposeDefaults_HasRequiredFields(t *testing.T) {
 		}
 	}
 
-	// Volumes default must reference the asset emitted alongside
-	// (4-segment scoped ref). Without this, the bind mount falls
-	// back to the redis docker image's empty /etc/redis/, redis
-	// fails to start with `Fatal error, can't open config file`.
+	// Volumes default must reference both assets emitted alongside:
+	// the redis.conf bind (without it redis won't start) and the
+	// entrypoint wrapper bind (without it the command path is a
+	// directory and exec fails).
 	vols, _ := d["volumes"].([]any)
-	if len(vols) != 1 {
-		t.Fatalf("expected 1 default volume, got %d", len(vols))
+	if len(vols) != 2 {
+		t.Fatalf("expected 2 default volumes (redis.conf + entrypoint), got %d", len(vols))
 	}
 
-	wantVol := "${asset.data.cache.redis_conf}:/etc/redis/redis.conf:ro"
-	if vols[0] != wantVol {
-		t.Errorf("default volume:\n  got:  %v\n  want: %s", vols[0], wantVol)
+	wantVols := []any{
+		"${asset.data.cache.redis_conf}:/etc/redis/redis.conf:ro",
+		"${asset.data.cache.entrypoint}:/usr/local/bin/voodu-redis-entrypoint:ro",
+	}
+	if !reflect.DeepEqual(vols, wantVols) {
+		t.Errorf("default volumes:\n  got:  %v\n  want: %v", vols, wantVols)
 	}
 
-	// Command default targets the bind-mounted path so a fresh
-	// `redis "..." "..." {}` boots with the curated redis.conf
-	// the plugin ships via get-conf.
+	// Command default invokes the wrapper via `sh` (asset files
+	// land non-executable; sh doesn't care about the +x bit).
 	cmd, _ := d["command"].([]any)
-	if len(cmd) != 2 || cmd[0] != "redis-server" || cmd[1] != "/etc/redis/redis.conf" {
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != "/usr/local/bin/voodu-redis-entrypoint" {
 		t.Errorf("default command unexpected: %v", cmd)
 	}
 }
@@ -361,10 +365,11 @@ func TestMergeSpec_EnvCoexistsWithDefaults(t *testing.T) {
 		t.Errorf("operator env should be present, got %v", env)
 	}
 
-	// Volumes default still present (env merge doesn't touch
-	// volumes).
+	// Volumes defaults still present (env merge doesn't touch
+	// volumes). Both the redis.conf bind AND the entrypoint
+	// wrapper bind must survive.
 	vols, _ := got["volumes"].([]any)
-	if len(vols) != 1 {
-		t.Errorf("volumes default lost when operator declared env: %v", vols)
+	if len(vols) != 2 {
+		t.Errorf("volumes defaults lost when operator declared env: %v", vols)
 	}
 }

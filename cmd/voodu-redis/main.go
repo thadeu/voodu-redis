@@ -236,16 +236,31 @@ func cmdExpand() error {
 
 	confWithAuth := appendRequirepass(confBytes, password)
 
+	// The entrypoint script is rendered with the instance's
+	// (scope, name) baked in so the master FQDN inside the
+	// script is the right one for THIS redis. Pure function —
+	// same inputs always produce the same bytes, so the asset
+	// digest stays stable across replays unless scope or name
+	// change (which would re-emit anyway).
+	entrypointBytes := renderEntrypointScript(req.Scope, req.Name)
+
 	asset := manifest{
 		Kind:  "asset",
 		Scope: req.Scope,
 		Name:  req.Name,
 		Spec: map[string]any{
 			"files": map[string]any{
-				"redis_conf": string(confWithAuth),
+				"redis_conf":       string(confWithAuth),
+				entrypointAssetKey: entrypointBytes,
 			},
 		},
 	}
+
+	// Note: the asset kind writes files with mode 0644, so the
+	// wrapper script lands non-executable on the host. We don't
+	// need the executable bit because composeDefaults invokes
+	// the script via `sh <path>` — sh doesn't care about the
+	// +x bit, only that the file is readable.
 
 	statefulset := manifest{
 		Kind:  "statefulset",
@@ -335,14 +350,34 @@ func readGeneratedConf() ([]byte, error) {
 // `volumes` and `command` are scope+name parameterised so the
 // 4-segment asset ref `${asset.<scope>.<name>.redis_conf}`
 // addresses the asset emitted alongside in the same expand call.
+//
+// Replication topology (M2):
+//
+//   - The wrapper script at /usr/local/bin/voodu-redis-entrypoint
+//     becomes the container's command. It reads VOODU_REPLICA_ORDINAL
+//     (per-pod, set by the controller) and REDIS_MASTER_ORDINAL
+//     (config bucket var, default 0) and execs redis-server with
+//     the right --replicaof flag. Single-replica deployments take
+//     the master branch and behave identically to the pre-M2 plugin.
+//   - The wrapper is shipped as a second asset key alongside
+//     redis_conf, so both files come from the same asset emission
+//     and are version-coupled (re-rendering one always re-renders
+//     the other).
 func composeDefaults(scope, name string) map[string]any {
 	return map[string]any{
 		"image":    defaultImage,
 		"replicas": 1,
 		"ports":    []any{"6379"},
-		"command":  []any{"redis-server", "/etc/redis/redis.conf"},
+		// Invoke the wrapper via `sh` so the asset's default
+		// 0644 mode is enough — the controller's atomicWrite
+		// doesn't currently support a per-file mode override,
+		// and `sh <script>` works regardless of the executable
+		// bit. If/when the asset kind grows file_modes, this
+		// can drop the explicit `sh`.
+		"command": []any{"sh", entrypointMountPath},
 		"volumes": []any{
 			"${asset." + scope + "." + name + ".redis_conf}:/etc/redis/redis.conf:ro",
+			"${asset." + scope + "." + name + "." + entrypointAssetKey + "}:" + entrypointMountPath + ":ro",
 		},
 		"volume_claims": []any{
 			map[string]any{

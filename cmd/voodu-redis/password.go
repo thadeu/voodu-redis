@@ -66,11 +66,23 @@ func generatePassword() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// appendRequirepass inserts a `requirepass <password>` line at
-// the END of the redis.conf bytes. Redis's directive-parsing
-// rule is "last wins", so even if the operator's get-conf
-// script already contained a different requirepass, ours
-// overrides cleanly.
+// appendRequirepass inserts `requirepass <password>` AND
+// `masterauth <password>` at the END of the redis.conf bytes.
+// Redis's directive-parsing rule is "last wins", so even if the
+// operator's get-conf script already contained these directives
+// with different values, ours override cleanly.
+//
+// Why both directives:
+//
+//   - requirepass: clients (and replicas connecting AS clients to
+//     the master) must authenticate with this password.
+//   - masterauth: the SAME password is used by replicas to dial
+//     the master after PSYNC. With requirepass set on the master,
+//     a replica without masterauth gets WRONGPASS during the
+//     resync handshake and never catches up. Always set both,
+//     always to the same value — this is the only configuration
+//     that works for the "1 master + N replicas, all on the same
+//     password" topology the plugin emits.
 //
 // We add a leading newline only if the existing bytes don't
 // already end with one — covers both `\n`-terminated configs
@@ -87,15 +99,19 @@ func generatePassword() (string, error) {
 func appendRequirepass(conf []byte, password string) []byte {
 	var b strings.Builder
 
-	b.Grow(len(conf) + len(password) + 64)
+	b.Grow(len(conf) + len(password)*2 + 128)
 	b.Write(conf)
 
 	if len(conf) > 0 && conf[len(conf)-1] != '\n' {
 		b.WriteByte('\n')
 	}
 
-	b.WriteString("\n# requirepass injected by voodu-redis plugin (do not edit; see `vd redis:new-password`)\n")
+	b.WriteString("\n# requirepass + masterauth injected by voodu-redis plugin\n")
+	b.WriteString("# (do not edit; see `vd redis:new-password`)\n")
 	b.WriteString("requirepass ")
+	b.WriteString(password)
+	b.WriteByte('\n')
+	b.WriteString("masterauth ")
 	b.WriteString(password)
 	b.WriteByte('\n')
 
