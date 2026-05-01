@@ -55,7 +55,13 @@ func cmdInfo() error {
 	host := redisHost(scope, name)
 	port := redisPort(spec)
 
-	connURL, _ := buildRedisURL(scope, name, spec, config)
+	// Same URL builder cmdLink uses for non-`--reads` consumers.
+	// Single-pod → one URL on the shared alias. Multi-pod → write
+	// URL pinned to the master ordinal, read URL on the round-
+	// robin pool. Mirrors what consumers actually see in their
+	// REDIS_URL / REDIS_READ_URL env vars so operator's view of
+	// "what to point a client at" matches the linked apps' view.
+	urls := buildLinkURLs(scope, name, spec, config, false)
 
 	// Data volume the plugin's defaults set up. Operator can
 	// override volume_claims; we read the resolved spec to show
@@ -125,13 +131,27 @@ func cmdInfo() error {
 
 	fmt.Fprintln(&out)
 	fmt.Fprintf(&out, "connect:\n")
-	// Connection URL is shown verbatim (with the password) so
-	// operator gets a copy/paste-ready string for the redis-cli
-	// or app config. Trade-off: visible on screen-shares.
-	// Operators wanting redaction can run `vd redis:info | sed
+	// Connection URLs are shown verbatim (with the password) so
+	// operator gets copy/paste-ready strings for redis-cli or
+	// app config. Trade-off: visible on screen-shares. Operators
+	// wanting redaction can run `vd redis:info | sed
 	// 's/:[^@]*@/:****@/'` on their side; the plugin opts for
 	// utility over caution by default.
-	fmt.Fprintf(&out, "  url:             %s\n", connURL)
+	//
+	// URL emission matches cmdLink's matrix:
+	//
+	//   - replicas == 1: just `url`, on the round-robin shared
+	//     alias (effectively a single pod).
+	//   - replicas  > 1: `write url` pins the master pod (writes
+	//     route directly) and `read url` fans out across every
+	//     replica via the round-robin alias. Apps using the
+	//     dual-URL pattern read from the pool, write to master.
+	if urls.ReadURL == "" {
+		fmt.Fprintf(&out, "  url:             %s\n", urls.WriteURL)
+	} else {
+		fmt.Fprintf(&out, "  write url:       %s\n", urls.WriteURL)
+		fmt.Fprintf(&out, "  read url:        %s\n", urls.ReadURL)
+	}
 
 	// Linked consumers: surface the list maintained by
 	// cmdLink/cmdUnlink so the operator can see "what breaks if
@@ -162,10 +182,16 @@ func cmdInfo() error {
 
 const infoHelp = `Usage: vd redis:info <scope/name>
 
-Show connection info, password storage, and data volume for a
-redis instance managed by voodu-redis. The connection URL is
-emitted verbatim (with password) so it's copy/paste-ready for
-redis-cli or app config — be aware on screen-shares.
+Show topology, connection URLs, and linked consumer list for a
+redis instance managed by voodu-redis. URLs are emitted verbatim
+(with password) so they're copy/paste-ready for redis-cli or
+app config — be aware on screen-shares.
+
+URL display matches what 'vd redis:link' injects on consumers:
+
+  replicas == 1   → single 'url' on the round-robin shared alias
+  replicas  > 1   → 'write url' pinned to the master ordinal +
+                    'read url' on the round-robin pool
 
 Example:
   vd redis:info clowk-lp/redis`
