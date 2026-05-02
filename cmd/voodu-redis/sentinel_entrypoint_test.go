@@ -131,14 +131,24 @@ func TestRenderSentinelEntrypointScript_PreflightCheck(t *testing.T) {
 }
 
 // TestRenderSentinelEntrypointScript_AuthPassConditional pins
-// the "REDIS_PASSWORD set → emit auth-pass; not set → skip" flow.
-// If we hardcoded auth-pass with empty value, sentinel would log
-// auth-failures every monitor cycle.
+// the "REDIS_PASSWORD set AND not already in conf → emit
+// auth-pass; not set OR already present → skip" flow.
+//
+// Two-level guard:
+//   - REDIS_PASSWORD env must be non-empty (otherwise we'd emit
+//     `sentinel auth-pass mymaster ` — invalid)
+//   - persistent conf must NOT already have an auth-pass line
+//     (otherwise restart appends duplicate, conf grows on each
+//     boot)
 func TestRenderSentinelEntrypointScript_AuthPassConditional(t *testing.T) {
 	script := renderSentinelEntrypointScript()
 
-	if !strings.Contains(script, `if [ -n "${REDIS_PASSWORD:-}" ]; then`) {
+	if !strings.Contains(script, `if [ -n "${REDIS_PASSWORD:-}" ]`) {
 		t.Errorf("auth-pass should be conditional on REDIS_PASSWORD being non-empty")
+	}
+
+	if !strings.Contains(script, `grep -q "^sentinel auth-pass "`) {
+		t.Errorf("auth-pass should be skipped when already present in persistent conf (avoids duplicates on restart)")
 	}
 
 	if !strings.Contains(script, "sentinel auth-pass mymaster $REDIS_PASSWORD") {
@@ -168,6 +178,52 @@ func TestRenderSentinelEntrypointScript_ExecsRedisServerWithSentinel(t *testing.
 	// this is the WHOLE reason we picked the redis-server form).
 	if strings.Contains(script, "exec redis-sentinel") {
 		t.Errorf("entrypoint should NOT exec the bare `redis-sentinel` binary (use `redis-server --sentinel` for image portability)")
+	}
+}
+
+// TestRenderSentinelEntrypointScript_PersistentBootstrapOnlyIfEmpty
+// pins THE fix for the bootstrap deadlock — sentinels boot with
+// the master DOWN can't discover peers via pubsub, can't reach
+// quorum, can't fail over. Persisting the runtime conf across
+// restarts (volume_claim mounted at /var/lib/sentinel/) means
+// peers + replicas survive pod recreation, so the new sentinel
+// doesn't need to re-discover.
+//
+// Pattern: bootstrap only if the persistent file is missing/empty.
+// First boot writes fresh conf; subsequent boots reuse the conf
+// sentinel has been rewriting at runtime with discovered state.
+func TestRenderSentinelEntrypointScript_PersistentBootstrapOnlyIfEmpty(t *testing.T) {
+	script := renderSentinelEntrypointScript()
+
+	if !strings.Contains(script, sentinelStatePath) {
+		t.Errorf("entrypoint should write conf to persistent path %q", sentinelStatePath)
+	}
+
+	if !strings.Contains(script, `if [ ! -s "$CONF" ]; then`) {
+		t.Errorf("entrypoint should bootstrap only when persistent conf is empty/missing")
+	}
+
+	if !strings.Contains(script, "reusing persistent sentinel.conf") {
+		t.Errorf("entrypoint should log when reusing persistent state (operator visibility)")
+	}
+}
+
+// TestComposeSentinelDefaults_HasPersistentVolumeClaim pins the
+// volume_claim that backs the persistent state. Without it, the
+// "preserve discovered peers across restart" feature degrades to
+// "fresh bootstrap every restart" silently — and the bootstrap
+// deadlock returns.
+func TestComposeSentinelDefaults_HasPersistentVolumeClaim(t *testing.T) {
+	d := composeSentinelDefaults("clowk-lp", "redis-quorum")
+
+	claims, ok := d["volume_claims"].([]any)
+	if !ok || len(claims) == 0 {
+		t.Fatalf("sentinel defaults missing volume_claims (would lose peer discovery state across pod restart)")
+	}
+
+	first, _ := claims[0].(map[string]any)
+	if first["mount_path"] != sentinelStateDir {
+		t.Errorf("volume_claim mount_path = %v, want %q", first["mount_path"], sentinelStateDir)
 	}
 }
 

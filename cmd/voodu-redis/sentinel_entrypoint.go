@@ -41,6 +41,14 @@ const (
 	sentinelEntrypointMountPath = "/usr/local/bin/voodu-sentinel-entrypoint"
 	sentinelHookMountPath       = "/usr/local/bin/voodu-sentinel-failover-hook"
 
+	// Persistent state dir — sentinel's runtime sentinel.conf lives
+	// here and survives pod recreation via volume_claim. Lets
+	// sentinels remember discovered peers + replicas across
+	// restarts, recovering from "master was down at sentinel boot"
+	// scenarios.
+	sentinelStateDir  = "/var/lib/sentinel"
+	sentinelStatePath = "/var/lib/sentinel/sentinel.conf"
+
 	// Sentinel listens on its own dedicated port — operators who
 	// link the sentinel resource to a consumer expect 26379 by
 	// muscle memory (Redis Sentinel default).
@@ -150,20 +158,24 @@ else
     MASTER_HOST="${VOODU_MONITOR_NAME}-${MASTER_ORDINAL}.${VOODU_MONITOR_SCOPE}.voodu"
 fi
 
-CONF=/etc/sentinel/sentinel.conf
-mkdir -p /etc/sentinel /etc/sentinel/conf.d
+CONF=` + sentinelStatePath + `
+mkdir -p ` + sentinelStateDir + ` /etc/sentinel/conf.d
 
-# Sentinel REWRITES this file at runtime to record observed
-# topology, so 0644 with sentinel-as-root is fine. The bytes
-# below are the bootstrap state; sentinel takes over after boot.
+# Bootstrap-only-if-empty: persisted sentinel.conf survives pod
+# restart so sentinels remember discovered peers + replicas (avoids
+# the bootstrap deadlock when master is down at sentinel boot —
+# without persistent state, sentinels can't discover peers via
+# the master's pubsub, can't reach quorum, no failover).
 #
-# The trailing 'include /etc/sentinel/conf.d/*.conf' is the
-# operator-override hatch — same pattern data redis uses for
-# ACLs at /etc/redis/conf.d/. Mount any extra .conf files via
-# the HCL volumes block to override down-after-milliseconds,
-# failover-timeout, parallel-syncs, etc., without editing the
-# generated bootstrap.
-cat > "$CONF" <<EOF
+# Empty/missing file → write fresh bootstrap.
+# Existing non-empty file → use as-is, sentinel rewrites it at
+# runtime with observed state.
+#
+# Operator-override .conf files at /etc/sentinel/conf.d/* are
+# always re-included on every boot regardless of bootstrap state.
+if [ ! -s "$CONF" ]; then
+    echo "voodu-sentinel: persistent state empty, writing bootstrap conf to $CONF" >&2
+    cat > "$CONF" <<EOF
 port ` + fmt.Sprintf("%d", sentinelPort) + `
 sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
@@ -174,13 +186,17 @@ sentinel parallel-syncs ` + sentinelMasterName + ` 1
 sentinel client-reconfig-script ` + sentinelMasterName + ` ` + sentinelHookMountPath + `
 include /etc/sentinel/conf.d/*.conf
 EOF
+else
+    echo "voodu-sentinel: reusing persistent sentinel.conf at $CONF (preserves discovered peers/replicas across restart)" >&2
+fi
 
-# auth-pass is opt-in via REDIS_PASSWORD env. Plugins that link
-# the data redis's password into this sentinel's bucket (planned
-# in M-S2/M-S4) get auth automatically; plugins that don't (ACL-
-# auth setups) skip this branch — sentinel falls back to no auth
-# which is fine when redis itself doesn't have requirepass.
-if [ -n "${REDIS_PASSWORD:-}" ]; then
+# auth-pass is opt-in via REDIS_PASSWORD env (flows in via env_from
+# from the monitor target's bucket). Written to the persistent
+# conf only on first bootstrap to avoid appending duplicates on
+# every restart. Password rotation post-bootstrap requires either
+# a SENTINEL SET auth-pass via redis-cli OR a wipe of the
+# persistent volume to re-bootstrap.
+if [ -n "${REDIS_PASSWORD:-}" ] && ! grep -q "^sentinel auth-pass " "$CONF" 2>/dev/null; then
     echo "sentinel auth-pass ` + sentinelMasterName + ` $REDIS_PASSWORD" >> "$CONF"
 fi
 
@@ -326,16 +342,34 @@ exit 0
 //   - command: invoke the sh wrapper via `sh <path>` so the
 //     asset's default 0644 mode is enough
 //   - ports: 26379 (sentinel default)
-//   - volumes: bind the entrypoint + hook scripts from the asset
-//     to the conventional /usr/local/bin paths
+//   - volumes: bind the entrypoint script from the asset; the
+//     hook is embedded inline in the entrypoint and chmod'd at
+//     boot (asset binds come 0644 read-only, breaks Redis)
+//   - volume_claims: persistent /var/lib/sentinel for the
+//     runtime sentinel.conf (see below)
 //
-// No volume_claims by default — sentinel rewrites its own
-// sentinel.conf at runtime in /etc/sentinel/, but for the MVP
-// that state is intentionally NOT persisted across restarts:
-// each pod re-bootstraps from the operator-declared monitor
-// at boot, which is more deterministic than recovering
-// half-known peer state from disk. Persistent sentinel state
-// can be added later via volume_claims override.
+// Why persistent sentinel.conf:
+//
+//   - Sentinels discover peers + replicas via pubsub on the
+//     monitored master. If a sentinel boots while master is
+//     DOWN (apply during incident, host reboot order race,
+//     plugin upgrade with master GC'd in between), it can't
+//     discover anything — gets stuck in +sdown solo, no
+//     quorum, no failover.
+//   - Persisting the runtime conf across pod restarts lets
+//     sentinel remember peers + replicas from previous
+//     successful runs, even if the master is unreachable on
+//     this boot. Quorum + failover work as soon as 2 of 3
+//     sentinels are up, regardless of master state.
+//   - Sentinel itself rewrites the conf at runtime to record
+//     observed topology. The volume claim makes those rewrites
+//     survive pod recreation.
+//
+// Bootstrap-only-if-empty pattern: the entrypoint checks if
+// /var/lib/sentinel/sentinel.conf already exists; if yes, uses
+// it as-is (preserves discovered state); if no (first apply or
+// volume wipe), writes the bootstrap directives and lets sentinel
+// take it from there.
 func composeSentinelDefaults(scope, name string) map[string]any {
 	scopeRef := scope
 	if scopeRef == "" {
@@ -351,6 +385,12 @@ func composeSentinelDefaults(scope, name string) map[string]any {
 		"ports":    []any{fmt.Sprintf("%d", sentinelPort)},
 		"volumes": []any{
 			"${asset." + scope + "." + name + "." + sentinelEntrypointAssetKey + "}:" + sentinelEntrypointMountPath + ":ro",
+		},
+		"volume_claims": []any{
+			map[string]any{
+				"name":       "state",
+				"mount_path": sentinelStateDir,
+			},
 		},
 	}
 }
