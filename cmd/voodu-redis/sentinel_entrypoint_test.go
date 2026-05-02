@@ -342,17 +342,17 @@ func TestComposeSentinelDefaults_Shape(t *testing.T) {
 	}
 }
 
-// TestComposeSentinelDefaults_VolumeBinds checks both asset
-// references resolve to the right scope/name and mount paths.
-// Asset path mismatch = entrypoint script not on disk = boot
-// failure with "no such file" — easy to debug but worth pinning.
+// TestComposeSentinelDefaults_VolumeBinds checks the entrypoint
+// asset is bind-mounted at the conventional path. Hook script is
+// NOT a separate volume — it's embedded inside the entrypoint
+// script and written to disk at boot with chmod +x (Redis won't
+// start sentinel with a non-executable client-reconfig-script).
 func TestComposeSentinelDefaults_VolumeBinds(t *testing.T) {
 	d := composeSentinelDefaults("clowk-lp", "redis-quorum")
 
 	vols, _ := d["volumes"].([]any)
 
 	wantEntrypoint := "${asset.clowk-lp.redis-quorum." + sentinelEntrypointAssetKey + "}:" + sentinelEntrypointMountPath + ":ro"
-	wantHook := "${asset.clowk-lp.redis-quorum." + sentinelHookAssetKey + "}:" + sentinelHookMountPath + ":ro"
 
 	found := map[string]bool{}
 	for _, v := range vols {
@@ -364,8 +364,12 @@ func TestComposeSentinelDefaults_VolumeBinds(t *testing.T) {
 		t.Errorf("missing entrypoint volume bind: %q", wantEntrypoint)
 	}
 
-	if !found[wantHook] {
-		t.Errorf("missing hook volume bind: %q", wantHook)
+	// Hook MUST NOT be its own volume bind anymore — if it were,
+	// the asset's 0644 mode would prevent Redis from executing it.
+	for v := range found {
+		if strings.Contains(v, "sentinel_hook") || strings.Contains(v, sentinelHookMountPath) {
+			t.Errorf("hook should NOT be a volume bind (would inherit 0644 read-only); got %q", v)
+		}
 	}
 }
 
@@ -537,11 +541,13 @@ func TestSentinelManifests_PairShape(t *testing.T) {
 	}
 }
 
-// TestSentinelManifests_AssetCarriesBothScripts confirms the
-// asset emits BOTH the entrypoint AND the failover hook. Missing
-// the hook would mean sentinel's client-reconfig-script directive
-// points at a non-existent path → noisy logs, no failover sync.
-func TestSentinelManifests_AssetCarriesBothScripts(t *testing.T) {
+// TestSentinelManifests_AssetCarriesEntrypointWithEmbeddedHook
+// confirms the asset emits the entrypoint script AND that the
+// entrypoint embeds the hook content (so the hook lands on disk
+// at boot via chmod +x without needing its own asset volume —
+// see Bug 1 fix: asset bind-mounts come 0644 read-only and Redis
+// refuses non-executable client-reconfig-script).
+func TestSentinelManifests_AssetCarriesEntrypointWithEmbeddedHook(t *testing.T) {
 	req := expandRequest{Scope: "clowk-lp", Name: "redis-quorum"}
 	s := &sentinelSpec{Enabled: true, Monitor: "clowk-lp/redis"}
 
@@ -553,15 +559,27 @@ func TestSentinelManifests_AssetCarriesBothScripts(t *testing.T) {
 		t.Errorf("asset missing %q file", sentinelEntrypointAssetKey)
 	}
 
-	if _, ok := files[sentinelHookAssetKey]; !ok {
-		t.Errorf("asset missing %q file", sentinelHookAssetKey)
+	// Hook is NOT a separate asset key anymore — it's embedded.
+	if _, ok := files["sentinel_hook"]; ok {
+		t.Errorf("asset should NOT carry a separate sentinel_hook file (now embedded inline)")
 	}
+
+	entrypoint, _ := files[sentinelEntrypointAssetKey].(string)
 
 	// Sanity: entrypoint must be the sentinel one, not a stale
 	// data-redis entrypoint.
-	entrypoint, _ := files[sentinelEntrypointAssetKey].(string)
 	if !hasSentinelMonitorRef(entrypoint) {
 		t.Errorf("entrypoint asset doesn't look like the sentinel script (no `sentinel monitor` directive)")
+	}
+
+	// Hook content must be embedded — pin a recognizable token from
+	// the hook body and the chmod that makes it executable.
+	if !strings.Contains(entrypoint, "voodu-sentinel-hook:") {
+		t.Errorf("entrypoint should embed the hook body (token `voodu-sentinel-hook:` not found)")
+	}
+
+	if !strings.Contains(entrypoint, "chmod +x "+sentinelHookMountPath) {
+		t.Errorf("entrypoint should chmod +x the hook after writing it to disk")
 	}
 }
 
