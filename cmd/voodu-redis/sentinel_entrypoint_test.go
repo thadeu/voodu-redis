@@ -518,6 +518,58 @@ func TestSentinelManifests_OperatorEnvFromCoexists(t *testing.T) {
 	}
 }
 
+// TestSentinelDefensiveUnsets pins the safety-net that prevents
+// stale config keys from poisoning sentinel pod env. Sentinels
+// inherit ALL state from the monitor target via env_from —
+// they MUST NOT have their own REDIS_PASSWORD or
+// REDIS_MASTER_ORDINAL, or those local values override env_from
+// (docker --env-file last-wins) and break auth.
+//
+// Common cause of stale keys: a pre-sentinel-aware plugin
+// version ran data-redis expand on what is now a sentinel
+// resource, generating its own password. After upgrade, the
+// stale value persists in the store. This unset clears it on
+// every apply, idempotent.
+func TestSentinelDefensiveUnsets(t *testing.T) {
+	req := expandRequest{Scope: "clowk-lp", Name: "redis-ha"}
+
+	got := sentinelDefensiveUnsets(req)
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 action, got %d", len(got))
+	}
+
+	a := got[0]
+
+	if a.Type != "config_unset" {
+		t.Errorf("Type = %q, want config_unset", a.Type)
+	}
+
+	if a.Scope != "clowk-lp" || a.Name != "redis-ha" {
+		t.Errorf("scope/name = %q/%q, want clowk-lp/redis-ha", a.Scope, a.Name)
+	}
+
+	wantKeys := map[string]bool{
+		"REDIS_PASSWORD":         true,
+		"REDIS_MASTER_ORDINAL":   true,
+		"REDIS_LINKED_CONSUMERS": true,
+	}
+
+	if len(a.Keys) != len(wantKeys) {
+		t.Errorf("Keys length = %d, want %d: %v", len(a.Keys), len(wantKeys), a.Keys)
+	}
+
+	for _, k := range a.Keys {
+		if !wantKeys[k] {
+			t.Errorf("unexpected key %q in unset list", k)
+		}
+	}
+
+	if !a.SkipRestart {
+		t.Errorf("SkipRestart must be true (unsets shouldn't roll the sentinels on every apply)")
+	}
+}
+
 // TestSentinelManifests_NoDuplicateMonitorInEnvFrom: if the
 // operator (oddly) wrote `env_from = ["clowk-lp/redis"]` already
 // pointing at the monitor target, mergeEnvFrom dedupes — final
