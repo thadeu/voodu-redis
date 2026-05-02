@@ -100,12 +100,12 @@ EOF
 
 ### Level 5 — declare your own asset, override volumes
 
-For complex configs (multiple files, ACL, TLS certs), declare your asset block standalone and bypass the plugin's:
+For complex configs (multiple files, custom users, TLS certs), declare your asset block standalone and bypass the plugin's:
 
 ```hcl
 asset "data" "redis-prod" {
   configuration = file("./redis-prod.conf")
-  users_acl     = file("./redis-users.acl")
+  custom_users  = file("./conf/users.conf")
   ca_pem        = url("https://r2.example.com/redis-ca.pem")
 }
 
@@ -113,13 +113,19 @@ redis "data" "cache" {
   command = ["redis-server", "/etc/redis/redis.conf"]
   volumes = [
     "${asset.redis-prod.configuration}:/etc/redis/redis.conf:ro",
-    "${asset.redis-prod.users_acl}:/etc/redis/users.acl:ro",
+    "${asset.redis-prod.custom_users}:/etc/redis/conf.d/users.conf:ro",
     "${asset.redis-prod.ca_pem}:/etc/redis/ca.pem:ro",
   ]
 }
 ```
 
 Operator volumes win; plugin's default asset (`asset/data/cache`) is still emitted but unmounted (~1KB orphan in `/opt/voodu/assets/data/cache/`). Acceptable for the flexibility.
+
+### ⚠️ Custom users / ACLs
+
+**Do NOT use Redis's `aclfile` directive on a voodu-redis-managed instance.** It silently overrides the plugin's `requirepass`, which either opens the cluster (no default user in the file) or breaks replication (default user with a different password). Use inline `user` directives at `/etc/redis/conf.d/<anything>.conf` instead — the plugin's password stays authoritative for the `default` user, replication keeps working, and `vd redis:new-password` stays automatic.
+
+Full example with explanation: [`examples/custom-acls/`](examples/custom-acls/).
 
 ## Plugin contract
 
