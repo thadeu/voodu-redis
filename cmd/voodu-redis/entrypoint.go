@@ -63,13 +63,28 @@ MASTER_ORDINAL="${REDIS_MASTER_ORDINAL:-0}"
 
 CONF=/etc/redis/redis.conf
 
+# Self-FQDN this pod announces to the master and to any sentinel
+# that asks via INFO replication. Without this, Redis announces
+# its docker bridge IP (172.x.x.x) — which makes sentinel learn
+# replicas by IP, not hostname. The auto-failover hook then
+# can't extract the ordinal from the new master address (regex
+# expects <name>-<ord>.<scope>.voodu form), and voodu store
+# stays stale post-failover.
+#
+# replica-announce-ip is misnamed — it accepts hostnames too.
+# With sentinel's resolve-hostnames yes (set in the sentinel
+# bootstrap conf), the FQDN propagates cleanly: master-side
+# INFO replication shows hostnames, sentinel records hostnames,
+# +switch-master event passes hostnames to client-reconfig-script.
+ANNOUNCE_HOST=__REPLICA_HOST_PREFIX__-${ORDINAL}__REPLICA_HOST_SUFFIX__
+
 if [ "$ORDINAL" = "$MASTER_ORDINAL" ]; then
     # Master: run with the conf as-is. The conf already declares
     # replica-read-only, replica-serve-stale-data, etc. — those
     # are no-ops on a master and become active if THIS pod is
     # ever demoted to a replica via a REDIS_MASTER_ORDINAL flip.
-    echo "voodu-redis: starting as MASTER (ordinal=$ORDINAL)" >&2
-    exec redis-server "$CONF"
+    echo "voodu-redis: starting as MASTER (ordinal=$ORDINAL, announce=$ANNOUNCE_HOST)" >&2
+    exec redis-server "$CONF" --replica-announce-ip "$ANNOUNCE_HOST"
 fi
 
 # Replica: dial master at the deterministic per-pod FQDN voodu0
@@ -77,8 +92,8 @@ fi
 # the masterauth directive in redis.conf — no env-var password
 # leakage on the command line.
 MASTER_HOST=__REPLICA_HOST_PREFIX__-${MASTER_ORDINAL}__REPLICA_HOST_SUFFIX__
-echo "voodu-redis: starting as REPLICA (ordinal=$ORDINAL) targeting $MASTER_HOST:6379" >&2
-exec redis-server "$CONF" --replicaof "$MASTER_HOST" 6379
+echo "voodu-redis: starting as REPLICA (ordinal=$ORDINAL, announce=$ANNOUNCE_HOST) targeting $MASTER_HOST:6379" >&2
+exec redis-server "$CONF" --replicaof "$MASTER_HOST" 6379 --replica-announce-ip "$ANNOUNCE_HOST"
 `
 
 // renderEntrypointScript materialises the script template for a

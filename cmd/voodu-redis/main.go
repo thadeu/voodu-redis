@@ -272,18 +272,16 @@ func cmdExpand() error {
 	if sentinel != nil && sentinel.Enabled {
 		// Sentinel-mode emission: distinct (asset, statefulset)
 		// pair from data-redis. The asset carries the sentinel
-		// entrypoint + failover hook scripts; the statefulset
-		// runs `redis-sentinel` instead of `redis-server`.
-		// Cross-resource state (target's REDIS_MASTER_ORDINAL
-		// for accurate boot, target's REDIS_PASSWORD for auth)
-		// is left to runtime: the entrypoint defaults to ordinal
-		// 0 and sentinel self-corrects via INFO replication;
-		// auth-pass is set only when REDIS_PASSWORD is in env
-		// (operator-supplied today; future plugin enhancement
-		// can flow it in via env_from when statefulsets gain
-		// that mechanism).
+		// entrypoint (with failover hook embedded inline); the
+		// statefulset runs redis-server --sentinel.
+		//
+		// All cross-resource state (REDIS_PASSWORD, REDIS_MASTER_ORDINAL,
+		// etc.) flows in via env_from from the monitor target's
+		// bucket — see sentinelManifests for the auto-emit of
+		// env_from = [monitor].
 		out := expandedPayload{
 			Manifests: sentinelManifests(req, sentinel, operatorSpec),
+			Actions:   sentinelDefensiveUnsets(req),
 		}
 
 		emitOK(out)

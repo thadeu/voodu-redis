@@ -538,3 +538,36 @@ func sentinelManifests(req expandRequest, s *sentinelSpec, operatorSpec map[stri
 func hasSentinelMonitorRef(script string) bool {
 	return strings.Contains(script, "sentinel monitor "+sentinelMasterName)
 }
+
+// sentinelDefensiveUnsets clears stale config keys from the
+// sentinel resource's OWN bucket on every apply. Sentinel pods
+// inherit ALL state from the monitor target via env_from — they
+// must never have their own REDIS_PASSWORD, REDIS_MASTER_ORDINAL,
+// REDIS_LINKED_CONSUMERS, etc., or those locally-set values
+// override env_from (docker --env-file last-wins) and break
+// auth / role detection.
+//
+// The most common way these get into the sentinel bucket is
+// the legacy path: an earlier voodu-redis version (pre sentinel
+// short-circuit) ran the data-redis expand on what is now a
+// sentinel resource, generating its own password. After upgrade
+// to the sentinel-aware plugin, the stale value persists in the
+// store and silently breaks auth.
+//
+// SkipRestart=true because these unsets shouldn't trigger a
+// rolling restart of the sentinel pods on every apply — the
+// env_from re-resolution at next reconcile picks up the
+// up-to-date target values without any restart needed.
+//
+// Idempotent: unsetting an already-empty key is a no-op.
+func sentinelDefensiveUnsets(req expandRequest) []dispatchAction {
+	return []dispatchAction{
+		{
+			Type:        "config_unset",
+			Scope:       req.Scope,
+			Name:        req.Name,
+			Keys:        []string{"REDIS_PASSWORD", "REDIS_MASTER_ORDINAL", "REDIS_LINKED_CONSUMERS"},
+			SkipRestart: true,
+		},
+	}
+}
