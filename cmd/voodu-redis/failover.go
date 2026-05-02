@@ -47,8 +47,8 @@ const failoverMasterKey = "REDIS_MASTER_ORDINAL"
 //
 // Args (os.Args[2:], flags interleaved):
 //
-//	[positional 0] target scope/name (the redis to flip)
-//	--to <ordinal> the ordinal to promote. Required.
+//	[positional 0]   target scope/name (the redis to flip)
+//	--replica <N>    ordinal of the replica to promote. Required.
 //
 // Sequence:
 //
@@ -74,11 +74,11 @@ func cmdFailover() error {
 	positional, target, hasTarget, noRestart := parseFailoverFlags(args)
 
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd redis:failover <scope/name> --to <ordinal> [--no-restart]")
+		return fmt.Errorf("usage: vd redis:failover <scope/name> --replica <ordinal> [--no-restart]")
 	}
 
 	if !hasTarget {
-		return fmt.Errorf("--to <ordinal> is required (the ordinal to promote to master)")
+		return fmt.Errorf("--replica <ordinal> is required (the ordinal to promote to master)")
 	}
 
 	scope, name := splitScopeName(positional[0])
@@ -115,7 +115,7 @@ func cmdFailover() error {
 	}
 
 	if target < 0 || target >= replicas {
-		return fmt.Errorf("--to %d out of range (valid: 0..%d)", target, replicas-1)
+		return fmt.Errorf("--replica %d out of range (valid: 0..%d)", target, replicas-1)
 	}
 
 	current := redisMasterOrdinal(config)
@@ -229,15 +229,21 @@ func cmdFailover() error {
 	})
 }
 
-// parseFailoverFlags extracts `--to <ordinal>` (space- or
+// parseFailoverFlags extracts `--replica <ordinal>` (space- or
 // =-separated) and `--no-restart` (boolean), returning the rest
 // as positional args. Order-agnostic — flags may precede or
 // follow the positional ref.
 //
-// Returns hasTarget=false when --to is absent so the caller can
-// distinguish "didn't pass --to" from "passed --to 0" (a valid
-// target — pod-0 is the default master, so --to 0 is the
-// recovery flow after a previous failover-to-1).
+// The flag reads as a sentence: `vd redis:failover clowk-lp/redis
+// --replica 1` = "redis: failover on clowk-lp/redis, promoting
+// replica 1". The resource name is already in the positional, so
+// the flag value is just the bare ordinal — no name duplication.
+//
+// Returns hasTarget=false when --replica is absent so the caller
+// can distinguish "didn't pass --replica" from "passed --replica 0"
+// (a valid target — pod-0 is the default master, so --replica 0
+// is the recovery flow after a previous failover to a non-zero
+// ordinal).
 //
 // noRestart=true means "skip the rolling restart of the redis
 // pods after recording the new ordinal". Used by the sentinel
@@ -249,8 +255,8 @@ func parseFailoverFlags(args []string) (positional []string, target int, hasTarg
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 
-		// Long-form `--to N`
-		if a == "--to" {
+		// Long-form `--replica N`
+		if a == "--replica" {
 			if i+1 < len(args) {
 				i++
 
@@ -263,9 +269,9 @@ func parseFailoverFlags(args []string) (positional []string, target int, hasTarg
 			continue
 		}
 
-		// Equals-form `--to=N`
-		if strings.HasPrefix(a, "--to=") {
-			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--to=")); err == nil {
+		// Equals-form `--replica=N`
+		if strings.HasPrefix(a, "--replica=") {
+			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--replica=")); err == nil {
 				target = n
 				hasTarget = true
 			}
@@ -284,7 +290,7 @@ func parseFailoverFlags(args []string) (positional []string, target int, hasTarg
 	return positional, target, hasTarget, noRestart
 }
 
-const failoverHelp = `Usage: vd redis:failover <scope/name> --to <ordinal> [--no-restart]
+const failoverHelp = `Usage: vd redis:failover <scope/name> --replica <ordinal> [--no-restart]
 
 Promote a specific ordinal to master. Flips REDIS_MASTER_ORDINAL
 on the provider's config bucket, refreshes every linked consumer's
@@ -323,6 +329,6 @@ roles via redis-cli (incident recovery) and just want voodu to
 catch up.
 
 Examples:
-  vd redis:failover clowk-lp/redis --to 1
-  vd redis:failover clowk-lp/redis --to=0                # recover after a failover-to-1
-  vd redis:failover clowk-lp/redis --to 1 --no-restart   # sentinel-driven, store-only sync`
+  vd redis:failover clowk-lp/redis --replica 1
+  vd redis:failover clowk-lp/redis --replica=0                # recover back to ordinal-0 master
+  vd redis:failover clowk-lp/redis --replica 1 --no-restart   # sentinel-driven, store-only sync`

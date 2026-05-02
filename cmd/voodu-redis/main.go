@@ -168,8 +168,9 @@ Commands:
       to propagate to redis.conf. Linked consumers are auto-
       refreshed with the new URL.
 
-  vd redis:failover <ref> --to <ordinal> [--no-restart]
-      Promote a specific replica ordinal to master. Flips
+  vd redis:failover <ref> --replica <ordinal> [--no-restart]
+      Promote a specific replica ordinal to master. Reads as
+      "redis: failover on <ref>, promoting replica N". Flips
       REDIS_MASTER_ORDINAL and refreshes linked consumer URLs.
       Default rolls the statefulset top-down. --no-restart skips
       the rolling restart (used by the sentinel auto-failover
@@ -322,7 +323,7 @@ func cmdExpand() error {
 	//   - Failover has an inherent async-replication data-loss
 	//     window. Doing it implicitly bundles the risk into a
 	//     scale-down operation that should be atomic + visible.
-	//   - The explicit path (`vd redis:failover --to 0`) already
+	//   - The explicit path (`vd redis:failover --replica 0`) already
 	//     refreshes consumer URLs and lets the operator drain
 	//     writes first if zero-loss matters.
 	//
@@ -448,7 +449,7 @@ func readGeneratedConf() ([]byte, error) {
 // (req.Config["REDIS_MASTER_ORDINAL"], default 0). If
 // `master_ordinal >= replicas`, applying would remove pod-N,
 // orphaning the cluster. We refuse with a message naming the
-// recovery path: `vd redis:failover ... --to 0` first, then re-apply.
+// recovery path: `vd redis:failover ... --replica 0` first, then re-apply.
 //
 // Returns nil for non-orphaning scale-downs and any scale-up.
 // First-apply (no master ordinal recorded) defaults to 0, which
@@ -470,7 +471,7 @@ func checkScaleDownDoesNotOrphanMaster(req expandRequest, merged map[string]any)
 
 	return fmt.Errorf(
 		"redis %s: cannot scale to replicas=%d while master is at ordinal %d (would prune the master and orphan the cluster). "+
-			"Run `vd redis:failover %s --to 0` first to move the master to a surviving ordinal, then re-apply.",
+			"Run `vd redis:failover %s --replica 0` first to move the master to a surviving ordinal, then re-apply.",
 		refOrName(req.Scope, req.Name), desired, masterOrd,
 		refOrName(req.Scope, req.Name),
 	)

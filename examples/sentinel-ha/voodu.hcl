@@ -39,7 +39,7 @@
 
 # ── Data redis ──────────────────────────────────────────────────────────────
 # Standard 3-node setup. Pod-0 is master by convention; pods 1-2
-# are async replicas. Failover (manual via `vd redis:failover --to N`
+# are async replicas. Failover (manual via `vd redis:failover --replica N`
 # or automatic via sentinel below) flips REDIS_MASTER_ORDINAL.
 redis "clowk-lp" "redis" {
   image    = "redis:8"

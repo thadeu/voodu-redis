@@ -156,7 +156,7 @@ Linking apps:
 - `vd redis:link <provider-scope/redis-quorum> <consumer>` — emits `REDIS_URL` pointing at the current data master, refreshed via the failover hook on auto-failover.
 - `vd redis:link --sentinel <provider-scope/redis-quorum> <consumer>` — also emits `REDIS_SENTINEL_HOSTS` + `REDIS_MASTER_NAME` for sentinel-aware clients (ioredis Sentinel, redis-py Sentinel, redis-rb sentinels, lettuce). Clients discover the master at runtime.
 
-Manual failover (`vd redis:failover <ref> --to <N>`) keeps working alongside sentinel — useful as an operator escape hatch. Pass `--no-restart` when you've already moved roles via redis-cli (incident recovery) and just want voodu's store to catch up.
+Manual failover (`vd redis:failover <ref> --replica <N>`) keeps working alongside sentinel — useful as an operator escape hatch. Pass `--no-restart` when you've already moved roles via redis-cli (incident recovery) and just want voodu's store to catch up.
 
 Full pattern with troubleshooting and migration paths: [`examples/sentinel-ha/`](examples/sentinel-ha/).
 

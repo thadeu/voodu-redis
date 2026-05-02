@@ -1,5 +1,5 @@
 name: redis
-version: 0.10.0
+version: 0.10.1
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
@@ -48,12 +48,13 @@ commands:
   - name: failover
     help: >
       Promote a specific replica ordinal to master. Usage:
-        vd redis:failover <scope/name> --to <ordinal> [--no-restart]
-      Flips REDIS_MASTER_ORDINAL on the provider's bucket,
-      refreshes every linked consumer's URL, and rolls the
-      statefulset top-down. One-shot — no `vd apply` needed;
-      the controller's config-change fan-out triggers the
-      rolling restart automatically.
+        vd redis:failover <scope/name> --replica <ordinal> [--no-restart]
+      Reads as a sentence: "redis: failover on <scope/name>,
+      promoting replica N". Flips REDIS_MASTER_ORDINAL on the
+      provider's bucket, refreshes every linked consumer's URL,
+      and rolls the statefulset top-down. One-shot — no `vd apply`
+      needed; the controller's config-change fan-out triggers
+      the rolling restart automatically.
       --no-restart skips the rolling restart of redis pods.
       Used by the sentinel auto-failover hook (roles already
       moved inside Redis) and by operators who manually flipped

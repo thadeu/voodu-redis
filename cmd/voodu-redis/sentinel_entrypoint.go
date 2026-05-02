@@ -178,8 +178,8 @@ exec redis-server "$CONF" --sentinel
 // renderSentinelHookScript produces the failover hook script
 // that sentinel calls on +switch-master via the
 // `client-reconfig-script` directive. M-S2 wires it through to
-// `vd redis:failover --to <new-ordinal> --no-restart` on the
-// monitored target — the --no-restart flag tells voodu "the
+// `vd redis:failover --replica <new-ordinal> --no-restart` on
+// the monitored target — the --no-restart flag tells voodu "the
 // roles already moved inside Redis (sentinel did it), just
 // sync the store so consumers' URLs refresh and crash-recovery
 // boots pick the right role".
@@ -260,11 +260,11 @@ fi
 TARGET="${VOODU_MONITOR_SCOPE}/${VOODU_MONITOR_NAME}"
 URL="${VOODU_CONTROLLER_URL%/}/plugin/redis/failover"
 
-# POST {"args":["<scope>/<name>","--to","<N>","--no-restart"]}
+# POST {"args":["<scope>/<name>","--replica","<N>","--no-restart"]}
 # The --no-restart flag is THE point of this callback path: roles
 # already moved inside Redis (that's what sentinel just did);
 # we're just informing voodu so consumers' URLs refresh.
-PAYLOAD=$(printf '{"args":["%s","--to","%s","--no-restart"]}' "$TARGET" "$NEW_ORDINAL")
+PAYLOAD=$(printf '{"args":["%s","--replica","%s","--no-restart"]}' "$TARGET" "$NEW_ORDINAL")
 
 # Retry up to 5 times with exponential backoff. Sentinel fires
 # this callback synchronously, so we keep total wall time bounded

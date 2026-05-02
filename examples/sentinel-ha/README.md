@@ -150,7 +150,7 @@ vd redis:link --reads --sentinel clowk-lp/redis-quorum clowk-lp/dashboard
 when they need to force a specific ordinal:
 
 ```sh
-vd redis:failover clowk-lp/redis --to 2
+vd redis:failover clowk-lp/redis --replica 2
 ```
 
 Sentinel detects the new role via `INFO replication` and respects
@@ -162,7 +162,7 @@ recovery via redis-cli), pass `--no-restart` to update voodu
 store WITHOUT touching the running pods:
 
 ```sh
-vd redis:failover clowk-lp/redis --to 2 --no-restart
+vd redis:failover clowk-lp/redis --replica 2 --no-restart
 ```
 
 This is also the path the sentinel auto-failover hook takes
@@ -192,7 +192,7 @@ If unset:
 - Sentinel still failovers correctly inside Redis (sentinel is
   self-contained on that path).
 - The voodu store stays stale until the operator runs a manual
-  `vd redis:failover --to <new-ordinal>`.
+  `vd redis:failover --replica <new-ordinal>`.
 - Apps using `REDIS_URL` (no `--sentinel`) keep talking to the
   old master FQDN, which now resolves to a replica → connection
   errors → manual fix needed.
@@ -223,7 +223,7 @@ preserved. No data migration.
 2. `vd apply --prune` — sentinel pods are removed. Data redis
    stays running.
 3. Future failovers go back to manual via
-   `vd redis:failover --to <N>`.
+   `vd redis:failover --replica <N>`.
 
 If you had used `--sentinel` on consumer links, re-run them
 without the flag (or `vd redis:unlink` then re-link). The plain
@@ -282,4 +282,4 @@ Look for `gave up after 5 attempts` — that's the hook telling
 you the callback failed. Common cause: `VOODU_CONTROLLER_URL`
 isn't set or points at an unreachable address from inside the
 sentinel container. Fix the env, re-apply, and run a manual
-`vd redis:failover --to <new-ordinal>` to catch the store up.
+`vd redis:failover --replica <new-ordinal>` to catch the store up.
