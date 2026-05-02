@@ -286,6 +286,20 @@ func renderSentinelHookScript() string {
 # bash's built-in TCP redirect.
 set -eu
 
+# log writes to /proc/1/fd/2 — the stderr of PID 1 (sentinel),
+# which docker captures into container logs visible via vd logs.
+# Plain stderr redirect from a sentinel-forked child sometimes
+# goes nowhere visible (Redis popen child handling drops or
+# buffers it), so the explicit /proc redirect is the reliable
+# path. Falls back to plain stderr if /proc is unwritable.
+log() {
+    if [ -w /proc/1/fd/2 ] 2>/dev/null; then
+        echo "$@" > /proc/1/fd/2
+    else
+        echo "$@" >&2
+    fi
+}
+
 MASTER_NAME="${1:-?}"
 ROLE="${2:-?}"
 STATE="${3:-?}"
@@ -294,7 +308,7 @@ FROM_PORT="${5:-?}"
 TO_IP="${6:-?}"
 TO_PORT="${7:-?}"
 
-echo "voodu-sentinel-hook: master=$MASTER_NAME role=$ROLE state=$STATE from=$FROM_IP:$FROM_PORT to=$TO_IP:$TO_PORT" >&2
+log "voodu-sentinel-hook: master=$MASTER_NAME role=$ROLE state=$STATE from=$FROM_IP:$FROM_PORT to=$TO_IP:$TO_PORT"
 
 # http_post URL BODY → returns 0 on 2xx, 1 otherwise. Plain HTTP
 # only (TLS not supported by /dev/tcp).
@@ -317,11 +331,23 @@ http_post() {
     [[ "$status_line" =~ HTTP/1\.[01]\ 2[0-9][0-9] ]]
 }
 
-# Only act on the "end" state — that's when the failover has
-# fully completed and the new master is serving. The "start"
-# event fires before promotion, when $TO_IP doesn't yet hold
-# the new master. Acting on start would write a stale ordinal.
-if [ "$STATE" != "end" ]; then
+# Act on both "start" and "end". Redis Sentinel calls
+# client-reconfig-script with different states depending on role:
+#   - LEADER: state=start at the beginning of failover (after the
+#     replica has been selected — TO_IP already holds the new
+#     master FQDN). The leader does NOT call state=end.
+#   - OBSERVER: state=end when the +switch-master event propagates
+#     via pubsub from the leader.
+#
+# Either way TO_IP/TO_PORT carry the new master, so we can act
+# safely. Multiple sentinels in the quorum each fire their own
+# callback (leader fires once with start, each observer fires
+# once with end) — the controller PUTs are idempotent (same
+# ordinal value lands every time).
+#
+# Skip any other state (e.g., "failed" if the failover aborts;
+# we don't want to record a bogus ordinal on abort).
+if [ "$STATE" != "start" ] && [ "$STATE" != "end" ]; then
     exit 0
 fi
 
@@ -330,7 +356,7 @@ fi
 # Operator-supplied (or future plugin enhancement):
 #   VOODU_CONTROLLER_URL → where to POST the callback
 if [ -z "${VOODU_CONTROLLER_URL:-}" ]; then
-    echo "voodu-sentinel-hook: VOODU_CONTROLLER_URL not set — store will be stale until next operator gesture" >&2
+    log "voodu-sentinel-hook: VOODU_CONTROLLER_URL not set — store will be stale until next operator gesture"
     exit 0
 fi
 
@@ -341,7 +367,7 @@ fi
 # the operator can run a manual ` + "`vd redis:failover`" + ` to fix).
 NEW_ORDINAL=$(echo "$TO_IP" | sed -nE 's/^[a-z0-9-]+-([0-9]+)\..*/\1/p')
 if [ -z "$NEW_ORDINAL" ]; then
-    echo "voodu-sentinel-hook: could not parse ordinal from to-ip=$TO_IP — store NOT updated" >&2
+    log "voodu-sentinel-hook: could not parse ordinal from to-ip=$TO_IP — store NOT updated"
     exit 0
 fi
 
@@ -354,6 +380,8 @@ URL="${VOODU_CONTROLLER_URL%/}/plugin/redis/failover"
 # we're just informing voodu so consumers' URLs refresh.
 PAYLOAD=$(printf '{"args":["%s","--replica","%s","--no-restart"]}' "$TARGET" "$NEW_ORDINAL")
 
+log "voodu-sentinel-hook: posting to $URL with payload $PAYLOAD"
+
 # Retry up to 5 times with exponential backoff. Sentinel fires
 # this callback synchronously, so we keep total wall time bounded
 # (~1+2+4+8+16 = 31s worst case). Beyond that, sentinel logs the
@@ -362,17 +390,17 @@ ATTEMPT=0
 SLEEP=1
 while [ "$ATTEMPT" -lt 5 ]; do
     if http_post "$URL" "$PAYLOAD"; then
-        echo "voodu-sentinel-hook: synced master ordinal=$NEW_ORDINAL to voodu store at $TARGET" >&2
+        log "voodu-sentinel-hook: synced master ordinal=$NEW_ORDINAL to voodu store at $TARGET"
         exit 0
     fi
 
     ATTEMPT=$((ATTEMPT + 1))
-    echo "voodu-sentinel-hook: callback attempt $ATTEMPT failed, retrying in ${SLEEP}s" >&2
+    log "voodu-sentinel-hook: callback attempt $ATTEMPT failed, retrying in ${SLEEP}s"
     sleep "$SLEEP"
     SLEEP=$((SLEEP * 2))
 done
 
-echo "voodu-sentinel-hook: gave up after 5 attempts; voodu store stale (ordinal=$NEW_ORDINAL not propagated to $TARGET)" >&2
+log "voodu-sentinel-hook: gave up after 5 attempts; voodu store stale (ordinal=$NEW_ORDINAL not propagated to $TARGET)"
 exit 0
 `
 }

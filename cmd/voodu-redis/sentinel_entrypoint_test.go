@@ -280,6 +280,32 @@ func TestRenderSentinelEntrypointScript_OperatorOverrideInclude(t *testing.T) {
 	}
 }
 
+// TestRenderSentinelHookScript_LogsToContainerStderr pins THE
+// fix that makes hook output visible in `vd logs`. Plain stderr
+// redirect (>&2) from a sentinel-forked child sometimes goes
+// nowhere visible — Redis's popen child handling buffers or
+// drops it. Writing explicitly to /proc/1/fd/2 (the stderr of
+// PID 1, which is sentinel) routes through to the container's
+// stderr → docker logs → vd logs.
+//
+// Without this, the entire failover hook is invisible to the
+// operator: it runs, it succeeds (or fails) silently, and the
+// only way to know is by checking voodu store state. Real
+// problem we hit during the F3 testing.
+func TestRenderSentinelHookScript_LogsToContainerStderr(t *testing.T) {
+	hook := renderSentinelHookScript()
+
+	if !strings.Contains(hook, "/proc/1/fd/2") {
+		t.Errorf("hook should write logs to /proc/1/fd/2 (sentinel/PID 1 stderr) for vd logs visibility")
+	}
+
+	// log() helper must exist — we use it everywhere instead of
+	// raw echo+>&2.
+	if !strings.Contains(hook, "log() {") {
+		t.Errorf("hook should define a log() helper function")
+	}
+}
+
 // TestRenderSentinelHookScript_AlwaysExits0 pins the
 // "exit 0 even on failure" decision. Sentinel treats non-zero
 // from client-reconfig-script as a failed callback and may log
@@ -326,15 +352,30 @@ func TestRenderSentinelHookScript_AcceptsSentinelArgs(t *testing.T) {
 	}
 }
 
-// TestRenderSentinelHookScript_OnlyActsOnEnd: sentinel fires the
-// hook on multiple events (start, end). Only the end state has
-// a finalised new master to record — acting on start would write
-// a stale ordinal because $TO_IP doesn't yet hold the new master.
-func TestRenderSentinelHookScript_OnlyActsOnEnd(t *testing.T) {
+// TestRenderSentinelHookScript_ActsOnStartOrEnd pins the
+// state-handling contract. Redis Sentinel calls
+// client-reconfig-script differently depending on role:
+//
+//   - LEADER: state=start at failover begin (after replica selected
+//     — TO_IP has the new master). Leader does NOT call state=end.
+//   - OBSERVER: state=end after seeing +switch-master via pubsub.
+//
+// Earlier the hook only acted on state=end, which meant the LEADER
+// (the sentinel that drives the failover) NEVER called the
+// callback — store stayed stale every time, even though sentinel
+// HA worked at the Redis level. Acting on either start OR end
+// covers both leader and observer code paths. Multiple invocations
+// from the quorum are idempotent (same ordinal PUT to the store).
+func TestRenderSentinelHookScript_ActsOnStartOrEnd(t *testing.T) {
 	hook := renderSentinelHookScript()
 
-	if !strings.Contains(hook, `if [ "$STATE" != "end" ]; then`) {
-		t.Errorf("hook should short-circuit on STATE != end")
+	if !strings.Contains(hook, `if [ "$STATE" != "start" ] && [ "$STATE" != "end" ]; then`) {
+		t.Errorf("hook should short-circuit ONLY on states other than start/end (leader fires start, observers fire end)")
+	}
+
+	// And it must NOT regress to end-only (the original bug).
+	if strings.Contains(hook, `if [ "$STATE" != "end" ]; then`) {
+		t.Errorf("hook regressed to end-only: leader never fires end, store would stay stale on every failover")
 	}
 }
 
