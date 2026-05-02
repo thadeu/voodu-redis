@@ -52,6 +52,21 @@ type dispatchAction struct {
 	Name  string            `json:"name"`
 	KV    map[string]string `json:"kv,omitempty"`
 	Keys  []string          `json:"keys,omitempty"`
+
+	// SkipRestart asks the controller to apply this config write
+	// WITHOUT triggering the usual restart fan-out on (Scope, Name).
+	// Default false (omitted in JSON) — every existing action keeps
+	// the historical "config_set → rolling restart" semantics.
+	//
+	// Used by `vd redis:failover --no-restart` for the sentinel
+	// auto-failover callback path: sentinel has already moved
+	// roles inside Redis (SLAVEOF NO ONE on new master, SLAVEOF X
+	// on replicas), so restarting the redis pods would (a) drop
+	// active connections needlessly and (b) risk a ping-pong with
+	// sentinel re-electing while the master pod is mid-reboot.
+	// Consumer URLs still need to refresh, so the consumer-targeted
+	// actions in the same envelope keep SkipRestart=false.
+	SkipRestart bool `json:"skip_restart,omitempty"`
 }
 
 // consumerEnvVar is the env-var name redis:link sets on the
@@ -66,6 +81,23 @@ const consumerEnvVar = "REDIS_URL"
 // REDIS_PROVIDER + REDIS_READ_URL pattern, picked up by Rails
 // 6+ replica-aware connection pooling.
 const consumerReadEnvVar = "REDIS_READ_URL"
+
+// consumerSentinelHostsEnvVar lists the sentinel pod endpoints
+// (comma-separated host:port). Emitted by `vd redis:link --sentinel`
+// alongside REDIS_URL/REDIS_READ_URL — sentinel-aware clients
+// (ioredis, redis-py with `Sentinel(...)`, lettuce, redis-rb
+// `Redis.new(sentinels: [...])`) read this to discover the
+// current master at runtime instead of trusting REDIS_URL through
+// failover events.
+const consumerSentinelHostsEnvVar = "REDIS_SENTINEL_HOSTS"
+
+// consumerMasterNameEnvVar matches the `sentinel monitor <name>`
+// directive in sentinel.conf — clients ask the sentinels "what's
+// the address of <name>?" to resolve the current master. The
+// plugin always uses the constant `mymaster` (matching the
+// entrypoint's sentinel.conf), so this env value is fixed; it's
+// emitted explicitly so consumers don't have to assume.
+const consumerMasterNameEnvVar = "REDIS_MASTER_NAME"
 
 // linkedConsumersKey is the config-bucket key on the provider
 // (the redis itself) that lists every consumer currently linked
@@ -121,10 +153,10 @@ func cmdLink() error {
 		return nil
 	}
 
-	positional, readsOnly := parseLinkFlags(args)
+	positional, readsOnly, sentinelMode := parseLinkFlags(args)
 
 	if len(positional) < 2 {
-		return fmt.Errorf("usage: vd redis:link [--reads] <provider-scope/name> <consumer-scope/name>")
+		return fmt.Errorf("usage: vd redis:link [--reads] [--sentinel] <provider-scope/name> <consumer-scope/name>")
 	}
 
 	providerRef := positional[0]
@@ -150,22 +182,61 @@ func cmdLink() error {
 
 	// Plugins that emit a statefulset (today: every voodu-redis-
 	// like plugin) fetch the spec via /describe.
-	spec, err := client.fetchSpec("statefulset", provScope, provName)
+	provSpec, err := client.fetchSpec("statefulset", provScope, provName)
 	if err != nil {
 		return fmt.Errorf("describe %s: %w", providerRef, err)
 	}
 
-	config, err := client.fetchConfig(provScope, provName)
+	// When the provider is a sentinel resource (detected by the
+	// VOODU_MONITOR_NAME env baked at expand time), URL building
+	// pivots on the MONITORED data redis: passwords, master ordinal,
+	// connection FQDNs all derive from the target, not the sentinel
+	// itself. The sentinel resource only contributes the discovery
+	// endpoints (REDIS_SENTINEL_HOSTS) when --sentinel is passed.
+	urlScope, urlName := provScope, provName
+	urlSpec := provSpec
+	urlConfig, err := client.fetchConfig(provScope, provName)
+
 	if err != nil {
 		return fmt.Errorf("config get %s: %w", providerRef, err)
 	}
 
-	urls := buildLinkURLs(provScope, provName, spec, config, readsOnly)
+	monitorTarget, isSentinelResource := monitorTargetFromSpec(provSpec)
+
+	if sentinelMode && !isSentinelResource {
+		return fmt.Errorf("--sentinel requires the provider to be a sentinel resource (with `sentinel { enabled = true }` block); %s appears to be a data redis", providerRef)
+	}
+
+	if isSentinelResource {
+		urlScope, urlName = monitorTarget.scope, monitorTarget.name
+
+		urlSpec, err = client.fetchSpec("statefulset", urlScope, urlName)
+		if err != nil {
+			return fmt.Errorf("describe monitor target %s/%s: %w", urlScope, urlName, err)
+		}
+
+		urlConfig, err = client.fetchConfig(urlScope, urlName)
+		if err != nil {
+			return fmt.Errorf("config get monitor target %s/%s: %w", urlScope, urlName, err)
+		}
+	}
+
+	urls := buildLinkURLs(urlScope, urlName, urlSpec, urlConfig, readsOnly)
 
 	consumerKV := map[string]string{consumerEnvVar: urls.WriteURL}
 
 	if urls.ReadURL != "" {
 		consumerKV[consumerReadEnvVar] = urls.ReadURL
+	}
+
+	if sentinelMode {
+		// Sentinel hosts derive from the SENTINEL resource's own
+		// (scope, name, replicas) — not the monitor target. Each
+		// sentinel pod has the standard <name>-<ord>.<scope>.voodu
+		// FQDN, listening on 26379.
+		hosts := buildSentinelHosts(provScope, provName, redisReplicas(provSpec))
+		consumerKV[consumerSentinelHostsEnvVar] = hosts
+		consumerKV[consumerMasterNameEnvVar] = sentinelMasterName
 	}
 
 	actions := []dispatchAction{
@@ -181,12 +252,22 @@ func cmdLink() error {
 	// can auto-refresh every linked consumer when the password
 	// rotates. Idempotent on re-link (consumer already in the
 	// list — no-op write of the same value).
-	updatedList := addLinkedConsumer(config, consScope, consName)
+	//
+	// When the provider is a sentinel resource, we track the
+	// consumer on the MONITOR TARGET's bucket — that's the bucket
+	// password rotation lives on, and the consumer needs its URL
+	// refreshed when the data redis's password changes.
+	trackScope, trackName := provScope, provName
+	if isSentinelResource {
+		trackScope, trackName = monitorTarget.scope, monitorTarget.name
+	}
+
+	updatedList := addLinkedConsumer(urlConfig, consScope, consName)
 
 	actions = append(actions, dispatchAction{
 		Type:  "config_set",
-		Scope: provScope,
-		Name:  provName,
+		Scope: trackScope,
+		Name:  trackName,
 		KV:    map[string]string{linkedConsumersKey: updatedList},
 	})
 
@@ -210,7 +291,7 @@ func cmdLink() error {
 // stripped any `vd`-level flags by the time argv reaches the
 // plugin, and a custom 10-line parser is easier to reason
 // about than configuring flag.NewFlagSet with a custom Usage.
-func parseLinkFlags(args []string) (positional []string, readsOnly bool) {
+func parseLinkFlags(args []string) (positional []string, readsOnly, sentinel bool) {
 	positional = make([]string, 0, len(args))
 
 	for _, a := range args {
@@ -219,10 +300,82 @@ func parseLinkFlags(args []string) (positional []string, readsOnly bool) {
 			continue
 		}
 
+		if a == "--sentinel" {
+			sentinel = true
+			continue
+		}
+
 		positional = append(positional, a)
 	}
 
-	return positional, readsOnly
+	return positional, readsOnly, sentinel
+}
+
+// monitorTarget is the parsed (scope, name) of a sentinel
+// resource's monitor field, surfaced via the env keys baked at
+// expand time. When the spec doesn't carry sentinel-mode env
+// (= it's a data redis, not a sentinel), isSentinel is false
+// and the (scope, name) values are zero — caller treats the
+// provider as a regular redis.
+type monitorTargetRef struct {
+	scope string
+	name  string
+}
+
+// monitorTargetFromSpec inspects a statefulset spec for the
+// VOODU_MONITOR_* env keys the sentinel-mode expand bakes in.
+// Detection is by env contract because the original `sentinel`
+// HCL block is stripped before manifest emission (see
+// stripSentinelBlock) — the env is the durable trace that says
+// "this resource is a sentinel quorum, not a data redis".
+//
+// Pure read of the spec map; no controller calls. Used by
+// cmdLink to:
+//
+//   - reject `--sentinel` when the provider isn't a sentinel
+//   - pivot URL building onto the monitored data redis when
+//     the operator links a sentinel resource (keeps REDIS_URL
+//     pointing at the actual master, not at sentinel:26379)
+func monitorTargetFromSpec(spec map[string]any) (monitorTargetRef, bool) {
+	env, ok := spec["env"].(map[string]any)
+	if !ok {
+		return monitorTargetRef{}, false
+	}
+
+	name, _ := env["VOODU_MONITOR_NAME"].(string)
+	if name == "" {
+		return monitorTargetRef{}, false
+	}
+
+	scope, _ := env["VOODU_MONITOR_SCOPE"].(string)
+
+	return monitorTargetRef{scope: scope, name: name}, true
+}
+
+// buildSentinelHosts emits the comma-separated host:port list
+// sentinel-aware clients expect on REDIS_SENTINEL_HOSTS. Each
+// sentinel pod gets one entry, indexed 0..replicas-1 against
+// the standard voodu0 FQDN scheme.
+//
+// Pure function (scope, name, replicas → string) — same inputs
+// always produce the same output, stable across re-links.
+func buildSentinelHosts(scope, name string, replicas int) string {
+	if replicas < 1 {
+		replicas = 1
+	}
+
+	hosts := make([]string, 0, replicas)
+	for i := 0; i < replicas; i++ {
+		host := fmt.Sprintf("%s-%d", strings.ToLower(strings.TrimSpace(name)), i)
+		if scope != "" {
+			host += "." + strings.ToLower(strings.TrimSpace(scope))
+		}
+
+		host += fmt.Sprintf(".voodu:%d", sentinelPort)
+		hosts = append(hosts, host)
+	}
+
+	return strings.Join(hosts, ",")
 }
 
 // linkURLs is the small bag of URLs cmdLink emits onto the
@@ -691,12 +844,19 @@ func cmdNewPassword() error {
 // os.Args. The plugin owns its own help; the CLI is a dumb
 // pass-through that doesn't intercept these flags.
 const (
-	linkHelp = `Usage: vd redis:link [--reads] <provider-scope/name> <consumer-scope/name>
+	linkHelp = `Usage: vd redis:link [--reads] [--sentinel] <provider-scope/name> <consumer-scope/name>
 
 Inject the redis provider's connection URL into the consumer's
 config bucket. The consumer auto-restarts to pick up the new env.
 
-URLs emitted:
+The provider can be either:
+  - a data redis (regular replication setup), OR
+  - a sentinel resource (declared with `+"`sentinel { enabled = true }`"+`),
+    in which case the URL emission pivots on the MONITORED data
+    redis but the consumer additionally gets sentinel discovery
+    info when --sentinel is passed.
+
+URLs emitted (data redis provider OR sentinel-pivoted target):
 
   replicas = 1
     REDIS_URL = redis://default:<pw>@<name>.<scope>.voodu:6379
@@ -708,12 +868,32 @@ URLs emitted:
   replicas > 1, --reads
     REDIS_URL      = redis://default:<pw>@<name>.<scope>.voodu:6379    (round-robin only)
 
+Additional env when --sentinel is passed (provider must be a sentinel):
+
+    REDIS_SENTINEL_HOSTS = sentinel-0.<scope>.voodu:26379,...,sentinel-N.<scope>.voodu:26379
+    REDIS_MASTER_NAME    = mymaster
+
+Use --sentinel for apps with sentinel-aware clients (ioredis with
+'Sentinel(...)', redis-py 'Sentinel(...)', lettuce, redis-rb
+with 'sentinels: [...]'). They discover the current master at
+runtime, surviving failover events without env-driven restart.
+
+Apps without a sentinel-aware client just use REDIS_URL and rely
+on voodu's env-change rolling restart to pick up failover events
+(post-failover, the controller updates REDIS_MASTER_ORDINAL on
+the data redis bucket, which re-emits all linked consumer URLs).
+
 The provider tracks linked consumers in REDIS_LINKED_CONSUMERS
 so 'vd redis:new-password' auto-refreshes every consumer URL.
+For sentinel resources, tracking lives on the monitored data
+redis (where the password lives).
 
 Examples:
   vd redis:link clowk-lp/redis clowk-lp/web
-  vd redis:link --reads clowk-lp/redis clowk-lp/dashboard`
+  vd redis:link --reads clowk-lp/redis clowk-lp/dashboard
+  vd redis:link clowk-lp/redis-quorum clowk-lp/web                # via sentinel, REDIS_URL only
+  vd redis:link --sentinel clowk-lp/redis-quorum clowk-lp/web     # via sentinel, full discovery
+  vd redis:link --reads --sentinel clowk-lp/redis-quorum clowk-lp/dash`
 
 	unlinkHelp = `Usage: vd redis:unlink <provider-scope/name> <consumer-scope/name>
 

@@ -154,9 +154,11 @@ func printPluginOverview() {
 	fmt.Println(`voodu-redis — managed redis instances via the voodu plugin contract
 
 Commands:
-  vd redis:link <provider> <consumer>
-      Inject the redis URL into the consumer's config.
-      Consumer auto-restarts to pick up the new env.
+  vd redis:link [--reads] [--sentinel] <provider> <consumer>
+      Inject the redis URL into the consumer's config. With
+      --sentinel, also emits REDIS_SENTINEL_HOSTS + REDIS_MASTER_NAME
+      for sentinel-aware clients (provider must be a sentinel
+      resource).
 
   vd redis:unlink <provider> <consumer>
       Remove the previously-injected REDIS_URL from the consumer.
@@ -166,16 +168,32 @@ Commands:
       to propagate to redis.conf. Linked consumers are auto-
       refreshed with the new URL.
 
-  vd redis:failover <ref> --to <ordinal>
-      Promote a specific replica ordinal to master. One-shot —
-      flips REDIS_MASTER_ORDINAL, refreshes linked consumer URLs,
-      and rolls the statefulset top-down. No 'vd apply' step
-      needed; the new master is live once the rolling restart
-      finishes.
+  vd redis:failover <ref> --to <ordinal> [--no-restart]
+      Promote a specific replica ordinal to master. Flips
+      REDIS_MASTER_ORDINAL and refreshes linked consumer URLs.
+      Default rolls the statefulset top-down. --no-restart skips
+      the rolling restart (used by the sentinel auto-failover
+      callback, where roles are already moved inside Redis).
 
   vd redis:info <ref>
       Show connection info, replication topology, and linked
       consumer list for a redis instance.
+
+Sentinel HA:
+  Declare a separate redis resource with a `+"`sentinel { }`"+` block
+  that watches a peer data redis. Quorum derives from replicas:
+  (replicas / 2) + 1. See examples/sentinel-ha/ for the full
+  pattern.
+
+  redis "scope" "redis-ha" {
+    sentinel {
+      monitor = "scope/redis"   # the data redis to watch
+    }
+  }
+
+  Block presence IS the enable signal — no enabled=true needed.
+  replicas defaults to 3 (HA minimum). Override sentinel defaults
+  via /etc/sentinel/conf.d/*.conf includes (mount via volumes).
 
 Per-command help:
   vd redis:<command> -h
@@ -224,6 +242,54 @@ func cmdExpand() error {
 		return errors.New("expand request missing required field 'name'")
 	}
 
+	var operatorSpec map[string]any
+
+	if len(req.Spec) > 0 {
+		if err := json.Unmarshal(req.Spec, &operatorSpec); err != nil {
+			return fmt.Errorf("decode block spec: %w", err)
+		}
+	}
+
+	// Sentinel mode (F3) — short-circuit BEFORE readGeneratedConf
+	// AND BEFORE the data-redis expand path, so we don't fork
+	// bin/get-conf (which produces redis-server config bytes a
+	// sentinel resource doesn't need) and don't run any of
+	// redis-server's lifecycle (password gen, requirepass append,
+	// master-orphan check) on what is actually a quorum resource.
+	// M-S0 lands HCL parse + apply-time validation here; M-S1 will
+	// replace the stub-error with the real sentinel-mode manifest
+	// emission.
+	sentinel, err := parseSentinelSpec(operatorSpec)
+	if err != nil {
+		return fmt.Errorf("sentinel block: %w", err)
+	}
+
+	if err := validateSentinelSpec(sentinel, req, operatorSpec); err != nil {
+		return err
+	}
+
+	if sentinel != nil && sentinel.Enabled {
+		// Sentinel-mode emission: distinct (asset, statefulset)
+		// pair from data-redis. The asset carries the sentinel
+		// entrypoint + failover hook scripts; the statefulset
+		// runs `redis-sentinel` instead of `redis-server`.
+		// Cross-resource state (target's REDIS_MASTER_ORDINAL
+		// for accurate boot, target's REDIS_PASSWORD for auth)
+		// is left to runtime: the entrypoint defaults to ordinal
+		// 0 and sentinel self-corrects via INFO replication;
+		// auth-pass is set only when REDIS_PASSWORD is in env
+		// (operator-supplied today; future plugin enhancement
+		// can flow it in via env_from when statefulsets gain
+		// that mechanism).
+		out := expandedPayload{
+			Manifests: sentinelManifests(req, sentinel, operatorSpec),
+		}
+
+		emitOK(out)
+
+		return nil
+	}
+
 	confBytes, err := readGeneratedConf()
 	if err != nil {
 		return fmt.Errorf("get-conf: %w", err)
@@ -233,15 +299,13 @@ func cmdExpand() error {
 		return errors.New("get-conf returned empty output (redis.conf must not be empty)")
 	}
 
-	var operatorSpec map[string]any
-
-	if len(req.Spec) > 0 {
-		if err := json.Unmarshal(req.Spec, &operatorSpec); err != nil {
-			return fmt.Errorf("decode block spec: %w", err)
-		}
-	}
-
 	merged := mergeSpec(composeDefaults(req.Scope, req.Name), operatorSpec)
+
+	// Defensive: if the operator wrote `sentinel { enabled = false }`
+	// to flip an existing resource off, the block survived parse +
+	// validate as a no-op. Strip it before emitting so it doesn't
+	// leak into the statefulset spec downstream.
+	stripSentinelBlock(merged)
 
 	// Scale-down sanity: refuse to apply a replicas count that
 	// would prune the current master ordinal. Without this,

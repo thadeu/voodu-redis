@@ -127,6 +127,39 @@ Operator volumes win; plugin's default asset (`asset/data/cache`) is still emitt
 
 Full example with explanation: [`examples/custom-acls/`](examples/custom-acls/).
 
+## High availability — Sentinel quorum
+
+For automatic failover with quorum-based promotion, declare a **separate redis resource** with a `sentinel` block that watches a peer data redis:
+
+```hcl
+redis "scope" "redis" {
+  replicas = 3
+}
+
+redis "scope" "redis-ha" {
+  sentinel {
+    monitor = "scope/redis"
+  }
+}
+```
+
+Minimal block — `monitor` is the only required field. `enabled = true` is implicit (block presence IS the intent), `replicas` defaults to 3 (HA minimum), quorum derives automatically.
+
+Two-resource design — same plugin, different mode. Adding HA = applying one new resource. Removing HA = `vd apply --prune` the sentinel resource. No tear-down coordination, no churn on the existing data redis.
+
+Quorum auto-derives from `replicas`: `(replicas / 2) + 1`. `replicas = 2` is rejected at apply (quorum math hostile); use 1 (observer-only) or ≥ 3 (HA). Default = 3.
+
+Override sentinel directives (down-after-milliseconds, failover-timeout, etc.) by mounting extra `.conf` files at `/etc/sentinel/conf.d/`. Same pattern as ACL overrides for data redis at `/etc/redis/conf.d/`. The generated bootstrap ends with `include /etc/sentinel/conf.d/*.conf`.
+
+Linking apps:
+
+- `vd redis:link <provider-scope/redis-quorum> <consumer>` — emits `REDIS_URL` pointing at the current data master, refreshed via the failover hook on auto-failover.
+- `vd redis:link --sentinel <provider-scope/redis-quorum> <consumer>` — also emits `REDIS_SENTINEL_HOSTS` + `REDIS_MASTER_NAME` for sentinel-aware clients (ioredis Sentinel, redis-py Sentinel, redis-rb sentinels, lettuce). Clients discover the master at runtime.
+
+Manual failover (`vd redis:failover <ref> --to <N>`) keeps working alongside sentinel — useful as an operator escape hatch. Pass `--no-restart` when you've already moved roles via redis-cli (incident recovery) and just want voodu's store to catch up.
+
+Full pattern with troubleshooting and migration paths: [`examples/sentinel-ha/`](examples/sentinel-ha/).
+
 ## Plugin contract
 
 ```bash

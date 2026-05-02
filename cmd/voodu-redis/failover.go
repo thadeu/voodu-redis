@@ -71,10 +71,10 @@ func cmdFailover() error {
 		return nil
 	}
 
-	positional, target, hasTarget := parseFailoverFlags(args)
+	positional, target, hasTarget, noRestart := parseFailoverFlags(args)
 
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd redis:failover <scope/name> --to <ordinal>")
+		return fmt.Errorf("usage: vd redis:failover <scope/name> --to <ordinal> [--no-restart]")
 	}
 
 	if !hasTarget {
@@ -140,12 +140,23 @@ func cmdFailover() error {
 
 	newConfig[failoverMasterKey] = strconv.Itoa(target)
 
+	// The redis-itself action carries SkipRestart when --no-restart
+	// was passed. This is the sentinel auto-failover path: roles
+	// have already moved inside Redis (SLAVEOF NO ONE on the new
+	// master), so we just want to record the new ordinal in the
+	// store WITHOUT triggering a rolling restart that would (a)
+	// drop active connections on the freshly promoted master and
+	// (b) risk a ping-pong with sentinel re-electing during the
+	// reboot window. Consumer URL refreshes (below) keep the
+	// default SkipRestart=false because consumers still need to
+	// pick up the new URL.
 	actions := []dispatchAction{
 		{
-			Type:  "config_set",
-			Scope: scope,
-			Name:  name,
-			KV:    map[string]string{failoverMasterKey: strconv.Itoa(target)},
+			Type:        "config_set",
+			Scope:       scope,
+			Name:        name,
+			KV:          map[string]string{failoverMasterKey: strconv.Itoa(target)},
+			SkipRestart: noRestart,
 		},
 	}
 
@@ -191,10 +202,22 @@ func cmdFailover() error {
 	// top-down. So the operator-visible flow is one-shot: failover
 	// → URLs refreshed → pods restarting → new master live. No
 	// trailing `vd apply` needed.
+	//
+	// Under --no-restart, the redis pods are NOT rolled (sentinel
+	// has already done the in-memory role flip). The store still
+	// records the new ordinal for crash-recovery boots; consumer
+	// URLs still refresh.
 	msg := fmt.Sprintf(
 		"redis %s: master ordinal %d → %d. Pods are rolling top-down; the new master picks up reads/writes once ordinal-%d finishes restarting.",
 		refOrName(scope, name), current, target, target,
 	)
+
+	if noRestart {
+		msg = fmt.Sprintf(
+			"redis %s: master ordinal %d → %d (--no-restart: store updated, redis pods NOT rolled — sentinel-driven role change assumed).",
+			refOrName(scope, name), current, target,
+		)
+	}
 
 	if refreshed > 0 {
 		msg = fmt.Sprintf("%s Refreshed %d linked consumer URL(s).", msg, refreshed)
@@ -207,14 +230,20 @@ func cmdFailover() error {
 }
 
 // parseFailoverFlags extracts `--to <ordinal>` (space- or
-// =-separated) and returns the rest as positional args. Order-
-// agnostic — flag may precede or follow the positional ref.
+// =-separated) and `--no-restart` (boolean), returning the rest
+// as positional args. Order-agnostic — flags may precede or
+// follow the positional ref.
 //
 // Returns hasTarget=false when --to is absent so the caller can
 // distinguish "didn't pass --to" from "passed --to 0" (a valid
 // target — pod-0 is the default master, so --to 0 is the
 // recovery flow after a previous failover-to-1).
-func parseFailoverFlags(args []string) (positional []string, target int, hasTarget bool) {
+//
+// noRestart=true means "skip the rolling restart of the redis
+// pods after recording the new ordinal". Used by the sentinel
+// auto-failover hook (sentinel has already moved roles inside
+// Redis; rolling pods would drop connections needlessly).
+func parseFailoverFlags(args []string) (positional []string, target int, hasTarget bool, noRestart bool) {
 	positional = make([]string, 0, len(args))
 
 	for i := 0; i < len(args); i++ {
@@ -244,13 +273,18 @@ func parseFailoverFlags(args []string) (positional []string, target int, hasTarg
 			continue
 		}
 
+		if a == "--no-restart" {
+			noRestart = true
+			continue
+		}
+
 		positional = append(positional, a)
 	}
 
-	return positional, target, hasTarget
+	return positional, target, hasTarget, noRestart
 }
 
-const failoverHelp = `Usage: vd redis:failover <scope/name> --to <ordinal>
+const failoverHelp = `Usage: vd redis:failover <scope/name> --to <ordinal> [--no-restart]
 
 Promote a specific ordinal to master. Flips REDIS_MASTER_ORDINAL
 on the provider's config bucket, refreshes every linked consumer's
@@ -274,6 +308,21 @@ Operators wanting zero-loss failover should drain writes first
 (app maintenance mode), run the failover, then resume traffic.
 Quorum-based graceful failover is the Sentinel feature in F3.
 
+--no-restart: skip the rolling restart of the redis statefulset.
+The store still updates with the new master ordinal (so consumers'
+URLs refresh and crash-recovery boots pick the right role), but
+the redis pods themselves are NOT rolled.
+
+Used by the sentinel auto-failover hook: sentinel has already
+flipped roles inside Redis (SLAVEOF NO ONE on the new master);
+rolling the pods would drop active connections AND risk a
+ping-pong with sentinel re-electing during the reboot window.
+
+Operators can also use --no-restart when they've manually moved
+roles via redis-cli (incident recovery) and just want voodu to
+catch up.
+
 Examples:
   vd redis:failover clowk-lp/redis --to 1
-  vd redis:failover clowk-lp/redis --to=0   # recover after a failover-to-1`
+  vd redis:failover clowk-lp/redis --to=0                # recover after a failover-to-1
+  vd redis:failover clowk-lp/redis --to 1 --no-restart   # sentinel-driven, store-only sync`

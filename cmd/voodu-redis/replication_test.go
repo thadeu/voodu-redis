@@ -338,7 +338,7 @@ func TestParseLinkFlags_OrderAgnostic(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pos, reads := parseLinkFlags(tc.in)
+			pos, reads, _ := parseLinkFlags(tc.in)
 
 			if !reflect.DeepEqual(pos, tc.pos) {
 				t.Errorf("positional: got %v, want %v", pos, tc.pos)

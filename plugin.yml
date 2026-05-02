@@ -1,10 +1,15 @@
 name: redis
-version: 0.9.4
+version: 0.10.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
   Replication-aware: replicas > 1 spawns 1 master + N-1 read replicas
   with async TCP replication, AOF persistence, and per-pod volumes.
+  HA via Sentinel: declare a sibling redis resource with a
+  `sentinel { enabled = true, monitor = "scope/name" }` block to run
+  redis-sentinel against a peer data redis. Auto-failover with
+  quorum-based promotion; consumer URLs refresh via the failover
+  hook. See examples/sentinel-ha/ for the full pattern.
 homepage: https://github.com/thadeu/voodu-redis
 
 commands:
@@ -22,10 +27,13 @@ commands:
     help: >
       Inject this redis's connection URL into a consumer's
       config bucket. Usage:
-        vd redis:link <provider-scope/name> <consumer-scope/name>
+        vd redis:link [--reads] [--sentinel] <provider> <consumer>
       Builds redis://default:<password>@<provider>.<scope>.voodu:<port>
       using the password from `vd config get` then HCL env, sets
       it as REDIS_URL on the consumer. Consumer auto-restarts.
+      When provider is a sentinel resource and --sentinel is set,
+      additionally emits REDIS_SENTINEL_HOSTS + REDIS_MASTER_NAME
+      for sentinel-aware clients.
   - name: unlink
     help: >
       Remove the previously-injected REDIS_URL from a consumer's
@@ -40,14 +48,16 @@ commands:
   - name: failover
     help: >
       Promote a specific replica ordinal to master. Usage:
-        vd redis:failover <scope/name> --to <ordinal>
+        vd redis:failover <scope/name> --to <ordinal> [--no-restart]
       Flips REDIS_MASTER_ORDINAL on the provider's bucket,
       refreshes every linked consumer's URL, and rolls the
       statefulset top-down. One-shot — no `vd apply` needed;
       the controller's config-change fan-out triggers the
-      rolling restart automatically. Manual failover only —
-      automatic graceful failover is the Sentinel feature
-      in F3.
+      rolling restart automatically.
+      --no-restart skips the rolling restart of redis pods.
+      Used by the sentinel auto-failover hook (roles already
+      moved inside Redis) and by operators who manually flipped
+      roles via redis-cli during incident recovery.
   - name: info
     help: >
       Show connection info for a redis instance: URL (redacted),
