@@ -95,8 +95,41 @@ func TestRenderSentinelEntrypointScript_SentinelDirectives(t *testing.T) {
 	}
 }
 
+// TestRenderSentinelEntrypointScript_NoWgetDependency pins THE
+// fix for the redis:8 image (Debian-slim) that doesn't ship
+// wget/curl. Both entrypoint preflight and the failover hook
+// MUST use bash's built-in /dev/tcp instead, so no extra
+// packages are needed at runtime.
+//
+// Shell shebang must be bash, not sh — /dev/tcp is a bash
+// extension and isn't in POSIX sh.
+func TestRenderSentinelEntrypointScript_NoWgetDependency(t *testing.T) {
+	entrypoint := renderSentinelEntrypointScript()
+	hook := renderSentinelHookScript()
+
+	for name, script := range map[string]string{"entrypoint": entrypoint, "hook": hook} {
+		if !strings.HasPrefix(script, "#!/bin/bash\n") {
+			t.Errorf("%s: must use bash shebang (/dev/tcp not in POSIX sh)", name)
+		}
+
+		// Look for actual command invocations (start of line, possibly indented).
+		// Comments mention wget/curl in explanatory text; that's fine.
+		for _, line := range strings.Split(script, "\n") {
+			trimmed := strings.TrimLeft(line, " \t")
+
+			if strings.HasPrefix(trimmed, "wget ") || strings.HasPrefix(trimmed, "curl ") {
+				t.Errorf("%s: must NOT invoke wget/curl as a command (redis:8 image has neither): %q", name, line)
+			}
+		}
+
+		if !strings.Contains(script, "/dev/tcp/") {
+			t.Errorf("%s: must use /dev/tcp for HTTP calls", name)
+		}
+	}
+}
+
 // TestRenderSentinelEntrypointScript_PreflightCheck pins M-S4:
-// the entrypoint runs a `wget` GET against /describe of the
+// the entrypoint runs an HTTP GET (via bash /dev/tcp) against /describe of the
 // monitor target before booting sentinel. Catches operator
 // typos (wrong scope/name in HCL) at boot rather than after
 // sentinel logs "master unreachable" 10 times.
@@ -518,25 +551,30 @@ func TestSentinelManifests_OperatorEnvFromCoexists(t *testing.T) {
 	}
 }
 
-// TestSentinelDefensiveUnsets pins the safety-net that prevents
-// stale config keys from poisoning sentinel pod env. Sentinels
-// inherit ALL state from the monitor target via env_from —
-// they MUST NOT have their own REDIS_PASSWORD or
-// REDIS_MASTER_ORDINAL, or those local values override env_from
-// (docker --env-file last-wins) and break auth.
+// TestSentinelDefensiveUnsets_StaleKeysPresent pins the
+// safety-net path: sentinel resource has stale REDIS_PASSWORD
+// in its bucket (from a pre-sentinel-aware plugin version that
+// generated one), defensive unset fires to clear it. This is
+// the one-time cleanup operators see on first apply post-upgrade.
 //
-// Common cause of stale keys: a pre-sentinel-aware plugin
-// version ran data-redis expand on what is now a sentinel
-// resource, generating its own password. After upgrade, the
-// stale value persists in the store. This unset clears it on
-// every apply, idempotent.
-func TestSentinelDefensiveUnsets(t *testing.T) {
-	req := expandRequest{Scope: "clowk-lp", Name: "redis-ha"}
+// SkipRestart MUST be false (default) — env file regeneration
+// happens via the restart fan-out; without it, store is clean
+// but disk env file keeps stale keys, container loads stale
+// values via --env-file, auth still broken.
+func TestSentinelDefensiveUnsets_StaleKeysPresent(t *testing.T) {
+	req := expandRequest{
+		Scope: "clowk-lp",
+		Name:  "redis-ha",
+		Config: map[string]string{
+			"REDIS_PASSWORD":       "stale-secret-from-old-plugin",
+			"REDIS_MASTER_ORDINAL": "1",
+		},
+	}
 
 	got := sentinelDefensiveUnsets(req)
 
 	if len(got) != 1 {
-		t.Fatalf("expected exactly 1 action, got %d", len(got))
+		t.Fatalf("expected exactly 1 action when stale keys present, got %d", len(got))
 	}
 
 	a := got[0]
@@ -549,24 +587,56 @@ func TestSentinelDefensiveUnsets(t *testing.T) {
 		t.Errorf("scope/name = %q/%q, want clowk-lp/redis-ha", a.Scope, a.Name)
 	}
 
-	wantKeys := map[string]bool{
-		"REDIS_PASSWORD":         true,
-		"REDIS_MASTER_ORDINAL":   true,
-		"REDIS_LINKED_CONSUMERS": true,
+	if a.SkipRestart {
+		t.Errorf("SkipRestart must be FALSE — env file regen requires restart fan-out, otherwise store is clean but disk env file keeps stale values and auth stays broken")
 	}
 
-	if len(a.Keys) != len(wantKeys) {
-		t.Errorf("Keys length = %d, want %d: %v", len(a.Keys), len(wantKeys), a.Keys)
-	}
-
+	// Only the present-and-non-empty stale keys should be in the
+	// unset list. REDIS_LINKED_CONSUMERS wasn't in req.Config,
+	// shouldn't appear.
+	gotKeys := map[string]bool{}
 	for _, k := range a.Keys {
-		if !wantKeys[k] {
-			t.Errorf("unexpected key %q in unset list", k)
-		}
+		gotKeys[k] = true
 	}
 
-	if !a.SkipRestart {
-		t.Errorf("SkipRestart must be true (unsets shouldn't roll the sentinels on every apply)")
+	if !gotKeys["REDIS_PASSWORD"] || !gotKeys["REDIS_MASTER_ORDINAL"] {
+		t.Errorf("Keys missing one of the stale entries; got %v", a.Keys)
+	}
+
+	if gotKeys["REDIS_LINKED_CONSUMERS"] {
+		t.Errorf("Keys includes REDIS_LINKED_CONSUMERS which wasn't in req.Config; should be conditional")
+	}
+}
+
+// TestSentinelDefensiveUnsets_NoStaleKeysReturnsNil pins the
+// steady-state path: sentinel bucket is clean (post-cleanup or
+// fresh resource), defensive unset fires NO action. Without
+// this, every apply would trigger an unnecessary restart fan-out
+// for a no-op unset.
+func TestSentinelDefensiveUnsets_NoStaleKeysReturnsNil(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  map[string]string
+	}{
+		{"empty config", map[string]string{}},
+		{"nil config", nil},
+		{"unrelated keys only", map[string]string{"OPERATOR_VAR": "x"}},
+		{"stale keys present but empty string", map[string]string{
+			"REDIS_PASSWORD":       "",
+			"REDIS_MASTER_ORDINAL": "",
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := expandRequest{Scope: "clowk-lp", Name: "redis-ha", Config: tc.cfg}
+
+			got := sentinelDefensiveUnsets(req)
+
+			if got != nil {
+				t.Errorf("expected nil (no action) for clean config, got %+v", got)
+			}
+		})
 	}
 }
 
