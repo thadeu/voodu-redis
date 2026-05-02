@@ -429,8 +429,16 @@ func composeSentinelDefaults(scope, name string) map[string]any {
 	return map[string]any{
 		"image":    defaultImage,
 		"replicas": 3,
-		"command":  []any{"sh", sentinelEntrypointMountPath},
-		"ports":    []any{fmt.Sprintf("%d", sentinelPort)},
+		// command MUST be bash, not sh. The asset bind is 0644
+		// (not executable) so we invoke via the interpreter
+		// directly — but the entrypoint script needs /dev/tcp
+		// for HTTP callbacks (preflight + failover hook), and
+		// /dev/tcp is a bash extension not present in dash (which
+		// is what /bin/sh is on Debian). The shebang
+		// #!/bin/bash gets ignored when invoked as `sh <path>`,
+		// so we explicitly call bash.
+		"command": []any{"bash", sentinelEntrypointMountPath},
+		"ports":   []any{fmt.Sprintf("%d", sentinelPort)},
 		"volumes": []any{
 			"${asset." + scope + "." + name + "." + sentinelEntrypointAssetKey + "}:" + sentinelEntrypointMountPath + ":ro",
 		},

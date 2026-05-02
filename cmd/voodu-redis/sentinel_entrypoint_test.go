@@ -421,8 +421,9 @@ func TestComposeSentinelDefaults_Shape(t *testing.T) {
 	}
 
 	cmd, ok := d["command"].([]any)
-	if !ok || len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != sentinelEntrypointMountPath {
-		t.Errorf("command should invoke `sh %s`, got %v", sentinelEntrypointMountPath, d["command"])
+	if !ok || len(cmd) != 2 || cmd[0] != "bash" || cmd[1] != sentinelEntrypointMountPath {
+		t.Errorf("command should invoke `bash %s` (NOT sh — script needs /dev/tcp which is a bash extension); got %v",
+			sentinelEntrypointMountPath, d["command"])
 	}
 
 	ports, ok := d["ports"].([]any)
