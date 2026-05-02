@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -339,6 +340,113 @@ func TestComposeDefaults_HasRequiredFields(t *testing.T) {
 	cmd, _ := d["command"].([]any)
 	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != "/usr/local/bin/voodu-redis-entrypoint" {
 		t.Errorf("default command unexpected: %v", cmd)
+	}
+}
+
+// TestCheckScaleDownDoesNotOrphanMaster pins the orphan-cluster
+// guard. Operator can't apply replicas=N while REDIS_MASTER_ORDINAL
+// >= N — that would silently prune the master, leaving the
+// cluster with replicas pointing at a dead host.
+//
+// Each case mirrors a realistic operator path: first-apply, scale-
+// up after failover, scale-down to a safe count, scale-down to an
+// unsafe count, and pathological config inputs.
+func TestCheckScaleDownDoesNotOrphanMaster(t *testing.T) {
+	cases := []struct {
+		name      string
+		config    map[string]string
+		replicas  int
+		wantError bool
+	}{
+		{
+			name:      "first apply (no master recorded) → default master ordinal 0",
+			config:    nil,
+			replicas:  3,
+			wantError: false,
+		},
+		{
+			name:      "master at 0, scale down from 3 to 1 → 0 < 1, safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "0"},
+			replicas:  1,
+			wantError: false,
+		},
+		{
+			name:      "master at 0, scale up to 5 → safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "0"},
+			replicas:  5,
+			wantError: false,
+		},
+		{
+			name:      "master at 1, scale down from 3 to 2 → 1 < 2, safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "1"},
+			replicas:  2,
+			wantError: false,
+		},
+		{
+			name:      "master at 2, scale down from 3 to 2 → 2 >= 2, REJECT",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "2"},
+			replicas:  2,
+			wantError: true,
+		},
+		{
+			name:      "master at 2, scale to 1 → REJECT",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "2"},
+			replicas:  1,
+			wantError: true,
+		},
+		{
+			name:      "master at 5, scale to 3 → REJECT",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "5"},
+			replicas:  3,
+			wantError: true,
+		},
+		{
+			name:      "master at 2, no scale-down (replicas stays 3) → safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "2"},
+			replicas:  3,
+			wantError: false,
+		},
+		{
+			name:      "garbage master ordinal value falls back to 0 → safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "primary"},
+			replicas:  2,
+			wantError: false,
+		},
+		{
+			name:      "negative master ordinal falls back to 0 → safe",
+			config:    map[string]string{"REDIS_MASTER_ORDINAL": "-1"},
+			replicas:  2,
+			wantError: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := expandRequest{
+				Scope:  "clowk-lp",
+				Name:   "redis",
+				Config: tc.config,
+			}
+
+			merged := map[string]any{
+				"replicas": float64(tc.replicas),
+			}
+
+			err := checkScaleDownDoesNotOrphanMaster(req, merged)
+
+			if (err != nil) != tc.wantError {
+				t.Errorf("got err=%v, wantError=%v", err, tc.wantError)
+			}
+
+			if tc.wantError && err != nil {
+				// Recovery path must be in the message — operators
+				// land here without context and need the next-step
+				// hint right there.
+				if !strings.Contains(err.Error(), "vd redis:failover") {
+					t.Errorf("error should mention recovery command, got: %v", err)
+				}
+			}
+		})
 	}
 }
 

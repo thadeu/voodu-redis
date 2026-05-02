@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -242,6 +243,31 @@ func cmdExpand() error {
 
 	merged := mergeSpec(composeDefaults(req.Scope, req.Name), operatorSpec)
 
+	// Scale-down sanity: refuse to apply a replicas count that
+	// would prune the current master ordinal. Without this,
+	// `vd apply` with replicas=2 on a redis whose master is at
+	// ordinal 2 would silently remove pod-2, leaving pods 0 and
+	// 1 as replicas tied to a non-existent master FQDN — cluster
+	// orphaned, no writes possible, replicas spinning forever
+	// trying to reconnect.
+	//
+	// Why reject (vs auto-failover-then-scale):
+	//
+	//   - Auto-failover during apply is surprising; the operator
+	//     ran apply to scale, not to flip roles.
+	//   - Failover has an inherent async-replication data-loss
+	//     window. Doing it implicitly bundles the risk into a
+	//     scale-down operation that should be atomic + visible.
+	//   - The explicit path (`vd redis:failover --to 0`) already
+	//     refreshes consumer URLs and lets the operator drain
+	//     writes first if zero-loss matters.
+	//
+	// Scale-up doesn't trigger this — adding ordinals doesn't
+	// touch the existing master.
+	if err := checkScaleDownDoesNotOrphanMaster(req, merged); err != nil {
+		return err
+	}
+
 	password, isNew, err := resolveOrGeneratePassword(req.Config)
 	if err != nil {
 		return fmt.Errorf("resolve password: %w", err)
@@ -347,6 +373,43 @@ func readGeneratedConf() ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+// checkScaleDownDoesNotOrphanMaster surfaces a clear pre-apply
+// error when the new replicas count would prune the ordinal
+// currently flagged as master in REDIS_MASTER_ORDINAL.
+//
+// The check pairs the operator's stated intent (the merged spec's
+// replicas value) against the runtime's recorded master ordinal
+// (req.Config["REDIS_MASTER_ORDINAL"], default 0). If
+// `master_ordinal >= replicas`, applying would remove pod-N,
+// orphaning the cluster. We refuse with a message naming the
+// recovery path: `vd redis:failover ... --to 0` first, then re-apply.
+//
+// Returns nil for non-orphaning scale-downs and any scale-up.
+// First-apply (no master ordinal recorded) defaults to 0, which
+// is < any replicas >= 1, so the path is also nil.
+func checkScaleDownDoesNotOrphanMaster(req expandRequest, merged map[string]any) error {
+	desired := redisReplicas(merged)
+
+	masterOrd := 0
+
+	if raw := req.Config["REDIS_MASTER_ORDINAL"]; raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			masterOrd = n
+		}
+	}
+
+	if masterOrd < desired {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"redis %s: cannot scale to replicas=%d while master is at ordinal %d (would prune the master and orphan the cluster). "+
+			"Run `vd redis:failover %s --to 0` first to move the master to a surviving ordinal, then re-apply.",
+		refOrName(req.Scope, req.Name), desired, masterOrd,
+		refOrName(req.Scope, req.Name),
+	)
 }
 
 // composeDefaults is the single source of truth for what the
