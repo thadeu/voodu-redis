@@ -84,7 +84,7 @@ type manifest struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-redis <expand|link|unlink|new-password|failover|info|help|--version>")
+		emitErr("usage: voodu-redis <expand|link|unlink|new-password|failover|info|backup|restore|help|--version>")
 		os.Exit(1)
 	}
 
@@ -128,6 +128,18 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "backup":
+		if err := cmdBackup(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "restore":
+		if err := cmdRestore(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	case "help":
 		// `vd redis -h` / `vd redis --help` reaches us here
 		// (CLI synthesizes a "help" command call). Plugin owns
@@ -136,7 +148,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|failover|info|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|failover|info|backup|restore|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -179,6 +191,16 @@ Commands:
   vd redis:info <ref>
       Show connection info, replication topology, and linked
       consumer list for a redis instance.
+
+  vd redis:backup <ref> --destination <path> [--source <ord>]
+      Dump RDB snapshot to a local file. Default source: highest-
+      ordinal replica (offload master). Operator wraps with own
+      cron + remote storage (s3/r2/scp/etc).
+
+  vd redis:restore <ref> --from <path>
+      Restore RDB into master. Replicas full-SYNC automatically.
+      Refused when sentinel is watching (manual sentinel coord
+      required, not supported in this milestone).
 
 Sentinel HA:
   Declare a separate redis resource with a `+"`sentinel { }`"+` block

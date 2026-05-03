@@ -1,5 +1,5 @@
 name: redis
-version: 0.11.0
+version: 0.12.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.
@@ -64,6 +64,25 @@ commands:
       Show connection info for a redis instance: URL (redacted),
       port, data volume, password storage location.
       `vd redis:info <scope/name>`.
+
+  - name: backup
+    help: >
+      Dump a Redis RDB snapshot from a pod to a local file. Usage:
+        vd redis:backup <scope/name> --destination <path> [--source <ord>]
+      Default source picks the highest-ordinal replica when
+      replicas > 1 (offload the master); ordinal 0 for single-pod.
+      Plugin owns the dump mechanics; operator wraps with cron +
+      remote storage (s3/r2/scp/etc).
+
+  - name: restore
+    help: >
+      Restore a Redis RDB snapshot into the master pod. Usage:
+        vd redis:restore <scope/name> --from <path>
+      Sequence: docker stop master, docker cp dump.rdb into the
+      data volume, wipe AOF, docker start master. Replicas detect
+      the divergent replication ID and full-SYNC automatically.
+      REFUSED when sentinel watches this redis (sentinel-aware
+      restore is a future feature).
   - name: help
     help: >
       Print plugin overview — list of commands and how to

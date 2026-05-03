@@ -336,6 +336,70 @@ console.log('value:', value);
 
 For latency-critical apps, use `--sentinel`. For simple workers, plain `REDIS_URL` is fine.
 
+## Backup & restore
+
+Plugin owns the redis-side mechanics; operator owns scheduling and remote storage. Two commands:
+
+```bash
+# Dump RDB to a local file
+vd redis:backup clowk-lp/redis --destination /var/backups/redis-snapshot.rdb
+
+# Restore RDB into the master (replicas full-SYNC automatically)
+vd redis:restore clowk-lp/redis --from /var/backups/redis-snapshot.rdb
+```
+
+### Backup
+
+`vd redis:backup` picks the source pod automatically:
+
+- **`replicas > 1`** → highest-ordinal replica (offloads the master)
+- **`replicas = 1`** → ordinal 0 (the master)
+- **`--source <ordinal>`** → force a specific pod (e.g. `--source 0` to snapshot directly from master)
+
+The destination path is on the controller's host filesystem. Wrap with your own scheduling + remote storage:
+
+```bash
+# Cron via voodu cronjob, systemd timer, GitHub Actions, etc:
+vd redis:backup clowk-lp/redis --destination /tmp/redis.rdb && \
+  aws s3 cp /tmp/redis.rdb s3://my-backups/redis-$(date +%Y%m%d-%H%M%S).rdb && \
+  rm /tmp/redis.rdb
+```
+
+For Cloudflare R2 (S3-compatible API):
+
+```bash
+aws s3 cp /tmp/redis.rdb s3://my-bucket/redis-snapshot.rdb \
+  --endpoint-url https://<account>.r2.cloudflarestorage.com
+```
+
+For pure-shell environments, `mc` (Minio client) is a small drop-in:
+
+```bash
+mc cp /tmp/redis.rdb r2/my-bucket/redis-snapshot.rdb
+```
+
+### Restore
+
+`vd redis:restore` swaps the master's `dump.rdb` and restarts. Sequence:
+
+1. `docker stop` the master pod (graceful, 30s timeout — Redis flushes pending writes)
+2. `docker cp` the local RDB into `<master>:/data/dump.rdb`
+3. Wipe AOF so Redis prefers the restored RDB on boot
+4. `docker start` the master — Redis loads the RDB
+5. Replicas reconnect, detect divergent replication ID, perform full SYNC
+
+Master is unavailable for writes during steps 1-4 (~5-10s for moderate dataset). Replicas serve stale reads (pre-restore data) until full SYNC completes.
+
+**Restore is REFUSED when a sentinel resource is watching this redis** (convention probe for `<name>-ha`, `<name>-sentinel`, `<name>-quorum`). Sentinel would interpret the master restart as a failure and trigger a spurious failover to a stale replica. Stop the sentinel temporarily first:
+
+```bash
+vd stop clowk-lp/redis-ha
+vd redis:restore clowk-lp/redis --from /var/backups/snap.rdb
+vd start clowk-lp/redis-ha   # sentinel re-discovers the new master state
+```
+
+Sentinel-aware restore (auto-coordinate sentinel pause/resume) is a future feature.
+
 ## Plugin contract
 
 ```bash
