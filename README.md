@@ -356,27 +356,147 @@ vd redis:restore clowk-lp/redis --from /var/backups/redis-snapshot.rdb
 - **`replicas = 1`** → ordinal 0 (the master)
 - **`--source <ordinal>`** → force a specific pod (e.g. `--source 0` to snapshot directly from master)
 
-The destination path is on the controller's host filesystem. Wrap with your own scheduling + remote storage:
+The destination path is on the controller's host filesystem. Plugin doesn't opine on schedule or remote storage — three patterns the operator can pick:
 
-```bash
-# Cron via voodu cronjob, systemd timer, GitHub Actions, etc:
-vd redis:backup clowk-lp/redis --destination /tmp/redis.rdb && \
-  aws s3 cp /tmp/redis.rdb s3://my-backups/redis-$(date +%Y%m%d-%H%M%S).rdb && \
-  rm /tmp/redis.rdb
+#### Option A — Linux cron / systemd timer (simplest)
+
+The `vd` CLI is already on the host. crontab calls it directly.
+
+```cron
+# /etc/crontab — root or whatever user runs voodu
+0 */6 * * * root vd redis:backup clowk-lp/redis --destination /tmp/r.rdb && \
+                  aws s3 cp /tmp/r.rdb s3://my-bucket/redis-$(date +\%Y\%m\%d-\%H\%M\%S).rdb && \
+                  rm /tmp/r.rdb
 ```
 
-For Cloudflare R2 (S3-compatible API):
+(Note the escaped `\%` — crontab interprets `%` as newline otherwise.)
 
-```bash
-aws s3 cp /tmp/redis.rdb s3://my-bucket/redis-snapshot.rdb \
-  --endpoint-url https://<account>.r2.cloudflarestorage.com
+systemd timer for better logging + retry semantics:
+
+```ini
+# /etc/systemd/system/redis-backup.service
+[Unit]
+Description=voodu-redis backup to S3
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'vd redis:backup clowk-lp/redis --destination /tmp/r.rdb && aws s3 cp /tmp/r.rdb s3://my-bucket/redis-$(date +%%Y%%m%%d-%%H%%M%%S).rdb && rm /tmp/r.rdb'
 ```
 
-For pure-shell environments, `mc` (Minio client) is a small drop-in:
+```ini
+# /etc/systemd/system/redis-backup.timer
+[Unit]
+Description=Run redis-backup every 6h
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
 
 ```bash
-mc cp /tmp/redis.rdb r2/my-bucket/redis-snapshot.rdb
+sudo systemctl enable --now redis-backup.timer
+sudo systemctl list-timers redis-backup
 ```
+
+**Pros:** uses the plugin command directly, simplest debug, zero new HCL.
+**Cons:** schedule lives outside HCL (not versioned with infra).
+
+#### Option B — voodu `cronjob { }` that bypasses the plugin (HCL-native)
+
+Schedule lives in HCL alongside redis. The cronjob container does the dump + upload directly via `redis-cli` and `aws-cli`, bypassing the plugin command entirely. `env_from` flows `REDIS_PASSWORD` from the data redis bucket — zero credential plumbing.
+
+```hcl
+cronjob "clowk-lp" "redis-backup" {
+  schedule = "0 */6 * * *"
+  image    = "amazon/aws-cli:latest"   # has aws-cli, missing redis-cli (we install at boot)
+
+  # REDIS_PASSWORD flows in from clowk-lp/redis bucket automatically.
+  env_from = ["clowk-lp/redis"]
+
+  env = {
+    AWS_ACCESS_KEY_ID     = "..."   # set via: vd config set clowk-lp/redis-backup AWS_ACCESS_KEY_ID=...
+    AWS_SECRET_ACCESS_KEY = "..."
+    AWS_DEFAULT_REGION    = "us-east-1"
+    # For Cloudflare R2: also set AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+  }
+
+  command = ["sh", "-c", <<-EOT
+    set -eu
+    yum install -y redis6 -q
+    # Stream dump straight from a replica → S3, no local file needed
+    redis-cli -h redis-2.clowk-lp.voodu -a "$REDIS_PASSWORD" --no-auth-warning --rdb - | \
+      aws s3 cp - s3://my-bucket/redis-$(date +%Y%m%d-%H%M%S).rdb
+  EOT
+  ]
+}
+```
+
+For Cloudflare R2, add `--endpoint-url $AWS_ENDPOINT_URL` to the `aws s3 cp`.
+
+To use a smaller image (`alpine` + `apk add`) without yum:
+
+```hcl
+cronjob "clowk-lp" "redis-backup" {
+  schedule = "0 */6 * * *"
+  image    = "alpine:latest"
+  env_from = ["clowk-lp/redis"]
+  env      = { /* AWS creds + region as above */ }
+
+  command = ["sh", "-c", <<-EOT
+    set -eu
+    apk add --no-cache redis aws-cli > /dev/null
+    redis-cli -h redis-2.clowk-lp.voodu -a "$REDIS_PASSWORD" --no-auth-warning --rdb - | \
+      aws s3 cp - s3://my-bucket/redis-$(date +%Y%m%d-%H%M%S).rdb
+  EOT
+  ]
+}
+```
+
+For zero-install boot (faster cronjob startup), build a custom image once:
+
+```dockerfile
+# Dockerfile — build once, push to your registry
+FROM alpine:latest
+RUN apk add --no-cache redis aws-cli
+```
+
+```hcl
+cronjob "clowk-lp" "redis-backup" {
+  schedule = "0 */6 * * *"
+  image    = "registry.example.com/redis-backup:latest"
+  env_from = ["clowk-lp/redis"]
+  env      = { /* AWS creds */ }
+
+  command = ["sh", "-c",
+    "redis-cli -h redis-2.clowk-lp.voodu -a $REDIS_PASSWORD --no-auth-warning --rdb - | aws s3 cp - s3://my-bucket/redis-$(date +%Y%m%d-%H%M%S).rdb"
+  ]
+}
+```
+
+**Pros:** schedule + creds versioned in HCL, env_from is elegant, no host-cron coupling.
+**Cons:** doesn't use the plugin's auto source-selection (replica ordinal hardcoded in command), needs custom image for fast startup.
+
+#### Option C — On-demand backup (manual, one-off)
+
+For migrations, snapshot before risky deploys, ad-hoc:
+
+```bash
+vd redis:backup clowk-lp/redis --destination /tmp/before-migration.rdb
+aws s3 cp /tmp/before-migration.rdb s3://my-bucket/migration-snapshot.rdb
+```
+
+The plugin command + manual upload. No schedule needed.
+
+#### Choosing between A and B
+
+| Use | Pick |
+|---|---|
+| Single-VM, operator OK with crontab/systemd | **A** — simplest, uses our plugin directly |
+| Multi-tenant or want infra 100% in HCL | **B** — declarative, env_from handles credentials cleanly |
+| Multi-VM with controller on one node only | **A** — `vd` CLI must run on the controller host |
 
 ### Restore
 
