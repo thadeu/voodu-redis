@@ -37,13 +37,23 @@ voodu-redis get-conf
 
 Highlights:
 
-- **`appendonly yes`** + **`appendfsync everysec`** — durability across restarts
-- **RDB snapshots** at 15min / 5min / 1min thresholds — fast recovery + AOF backup
+- **RDB-only persistence** — `save 900 1 / 300 10 / 60 10000` thresholds, AOF disabled (see "Why no AOF" below). Up to ~60s of writes lost on crash.
 - **`maxclients 10000`** — generous connection pool
 - **`tcp-keepalive 60`** — drops dead connections quickly
 - **`timeout 0`** — never close idle clients (override if needed)
 - **`protected-mode yes`** — refuses unauth'd external connections
 - **`maxmemory-policy noeviction`** — safe default; pure cache use cases override (see below)
+
+**Why no AOF (since v0.13.0):** AOF takes precedence over RDB on Redis boot. With AOF on, `vd redis:restore` silently fails — the restored `dump.rdb` is ignored because Redis loads the AOF (which still has the operator's pre-restore writes). RDB-only persistence keeps backup/restore semantics simple: `dump.rdb` IS the truth.
+
+If your workload needs hard durability (financial state, no-loss queues), override via `/etc/redis/conf.d/*.conf`:
+
+```conf
+appendonly yes
+appendfsync everysec
+```
+
+But know that re-enabling AOF means future restores need manual AOF wipe — see "Restore" section below.
 
 The conf is committed in this repo at `conf/redis.conf` — read it once, you'll know everything that runs.
 
@@ -500,15 +510,39 @@ The plugin command + manual upload. No schedule needed.
 
 ### Restore
 
-`vd redis:restore` swaps the master's `dump.rdb` and restarts. Sequence:
+`vd redis:restore` swaps the master's `dump.rdb` and restarts. Three lines:
 
-1. `docker stop` the master pod (graceful, 30s timeout — Redis flushes pending writes)
+1. `docker stop` the master pod (graceful, 30s timeout — Redis flushes pending state)
 2. `docker cp` the local RDB into `<master>:/data/dump.rdb`
-3. Wipe AOF so Redis prefers the restored RDB on boot
-4. `docker start` the master — Redis loads the RDB
-5. Replicas reconnect, detect divergent replication ID, perform full SYNC
+3. `docker start` the master — Redis loads the new dump.rdb
 
-Master is unavailable for writes during steps 1-4 (~5-10s for moderate dataset). Replicas serve stale reads (pre-restore data) until full SYNC completes.
+Replicas detect the divergent replication ID after master restarts and perform full SYNC from the restored state. No replica orchestration needed.
+
+Master is unavailable for writes during the ~3-5s restart. Replicas serve stale reads until full SYNC completes.
+
+**Important — only works with default AOF-disabled config.** If you re-enable AOF via conf override (`appendonly yes`), Redis on boot loads the AOF (with all the operator's pre-restore writes) and ignores the freshly-imported `dump.rdb`. Restore appears to do nothing.
+
+If you must run with AOF enabled, do the manual restore that wipes AOF:
+
+```bash
+PWD=$(vd config get clowk-lp/redis REDIS_PASSWORD)
+ORD=$(vd config get clowk-lp/redis REDIS_MASTER_ORDINAL)
+[ -z "$ORD" ] && ORD=0
+
+docker stop -t 30 clowk-lp-redis.$ORD
+
+# Wipe ALL AOF state + replace dump.rdb in one ephemeral container
+docker run --rm \
+  --volumes-from clowk-lp-redis.$ORD \
+  -v /tmp:/backup:ro \
+  busybox sh -c "
+    rm -rf /data/appendonlydir /data/appendonly.aof
+    cp /backup/snap.rdb /data/dump.rdb
+    chown -R 999:999 /data
+  "
+
+docker start clowk-lp-redis.$ORD
+```
 
 **Restore is REFUSED when a sentinel resource is watching this redis** (convention probe for `<name>-ha`, `<name>-sentinel`, `<name>-quorum`). Sentinel would interpret the master restart as a failure and trigger a spurious failover to a stale replica. Stop the sentinel temporarily first:
 
