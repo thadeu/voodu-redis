@@ -218,7 +218,7 @@ sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
 sentinel monitor ` + sentinelMasterName + ` $MASTER_HOST 6379 $QUORUM
 sentinel down-after-milliseconds ` + sentinelMasterName + ` 5000
-sentinel failover-timeout ` + sentinelMasterName + ` 60000
+sentinel failover-timeout ` + sentinelMasterName + ` 30000
 sentinel parallel-syncs ` + sentinelMasterName + ` 1
 sentinel client-reconfig-script ` + sentinelMasterName + ` ` + sentinelHookMountPath + `
 include /etc/sentinel/conf.d/*.conf
