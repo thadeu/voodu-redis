@@ -101,5 +101,5 @@ redis "clowk-lp" "redis-quorum" {
 #
 # With ./conf/sentinel-overrides.conf:
 #
-#   sentinel down-after-milliseconds mymaster 2000
-#   sentinel failover-timeout mymaster 30000
+#   sentinel down-after-milliseconds voodu-master 2000
+#   sentinel failover-timeout voodu-master 30000

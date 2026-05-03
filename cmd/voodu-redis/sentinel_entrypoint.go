@@ -57,10 +57,14 @@ const (
 	// Master name in sentinel.conf. Hard-coded — operators don't
 	// configure this because it's an INTERNAL identifier sentinel
 	// uses to refer to the monitored master in commands like
-	// `SENTINEL FAILOVER mymaster`. The link command emits
-	// REDIS_MASTER_NAME=mymaster so consumers using a sentinel-
+	// `SENTINEL FAILOVER voodu-master`. The link command emits
+	// REDIS_MASTER_NAME=voodu-master so consumers using a sentinel-
 	// aware client know what to ask for.
-	sentinelMasterName = "mymaster"
+	//
+	// Voodu-prefixed (rather than the Redis-doc default "mymaster")
+	// so logs and SENTINEL-* command output are immediately
+	// recognizable as voodu-managed in mixed environments.
+	sentinelMasterName = "voodu-master"
 )
 
 // renderSentinelEntrypointScript produces the sh wrapper the
@@ -261,7 +265,7 @@ exec redis-server "$CONF" --sentinel
 //
 // Sentinel passes positional args (per Redis docs):
 //
-//	$1 master-name (e.g. "mymaster")
+//	$1 master-name (always "voodu-master" — see sentinelMasterName)
 //	$2 role (leader|observer)
 //	$3 state (start|end)
 //	$4 from-ip

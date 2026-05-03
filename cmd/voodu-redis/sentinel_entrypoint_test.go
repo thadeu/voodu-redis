@@ -79,11 +79,11 @@ func TestRenderSentinelEntrypointScript_SentinelDirectives(t *testing.T) {
 	script := renderSentinelEntrypointScript()
 
 	mustContain := []string{
-		"sentinel monitor mymaster",
-		"sentinel down-after-milliseconds mymaster",
-		"sentinel failover-timeout mymaster",
-		"sentinel parallel-syncs mymaster",
-		"sentinel client-reconfig-script mymaster",
+		"sentinel monitor voodu-master",
+		"sentinel down-after-milliseconds voodu-master",
+		"sentinel failover-timeout voodu-master",
+		"sentinel parallel-syncs voodu-master",
+		"sentinel client-reconfig-script voodu-master",
 		"sentinel resolve-hostnames yes",
 		"sentinel announce-hostnames yes",
 	}
@@ -178,7 +178,7 @@ func TestRenderSentinelEntrypointScript_AuthPassConditional(t *testing.T) {
 		t.Errorf("auth-pass should be conditional on REDIS_PASSWORD being non-empty")
 	}
 
-	if !strings.Contains(script, "sentinel auth-pass mymaster $REDIS_PASSWORD") {
+	if !strings.Contains(script, "sentinel auth-pass voodu-master $REDIS_PASSWORD") {
 		t.Errorf("auth-pass directive shape drifted")
 	}
 }

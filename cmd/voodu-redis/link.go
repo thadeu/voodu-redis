@@ -94,7 +94,7 @@ const consumerSentinelHostsEnvVar = "REDIS_SENTINEL_HOSTS"
 // consumerMasterNameEnvVar matches the `sentinel monitor <name>`
 // directive in sentinel.conf — clients ask the sentinels "what's
 // the address of <name>?" to resolve the current master. The
-// plugin always uses the constant `mymaster` (matching the
+// plugin always uses the constant `voodu-master` (matching the
 // entrypoint's sentinel.conf), so this env value is fixed; it's
 // emitted explicitly so consumers don't have to assume.
 const consumerMasterNameEnvVar = "REDIS_MASTER_NAME"
@@ -871,7 +871,7 @@ URLs emitted (data redis provider OR sentinel-pivoted target):
 Additional env when --sentinel is passed (provider must be a sentinel):
 
     REDIS_SENTINEL_HOSTS = sentinel-0.<scope>.voodu:26379,...,sentinel-N.<scope>.voodu:26379
-    REDIS_MASTER_NAME    = mymaster
+    REDIS_MASTER_NAME    = voodu-master
 
 Use --sentinel for apps with sentinel-aware clients (ioredis with
 'Sentinel(...)', redis-py 'Sentinel(...)', lettuce, redis-rb

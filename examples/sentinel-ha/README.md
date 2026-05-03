@@ -87,13 +87,13 @@ With `./conf/sentinel-overrides.conf`:
 
 ```
 # Tighten failover detection (default 5000ms)
-sentinel down-after-milliseconds mymaster 2000
+sentinel down-after-milliseconds voodu-master 2000
 
 # Shorter failover ceiling (default 60000ms)
-sentinel failover-timeout mymaster 30000
+sentinel failover-timeout voodu-master 30000
 
 # Drain replicas one at a time during sync (default 1)
-sentinel parallel-syncs mymaster 1
+sentinel parallel-syncs voodu-master 1
 ```
 
 Sentinel rewrites the MAIN sentinel.conf at runtime to record
@@ -130,7 +130,7 @@ Emits:
 
 - `REDIS_URL` — current master, same as above (for fallback)
 - `REDIS_SENTINEL_HOSTS` — `redis-quorum-0.clowk-lp.voodu:26379,redis-quorum-1.clowk-lp.voodu:26379,redis-quorum-2.clowk-lp.voodu:26379`
-- `REDIS_MASTER_NAME` — `mymaster`
+- `REDIS_MASTER_NAME` — `voodu-master`
 
 Sentinel-aware clients (ioredis with `Sentinel(...)`,
 redis-py `Sentinel(...)`, redis-rb `sentinels: [...]`, lettuce)
