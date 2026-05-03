@@ -54,7 +54,7 @@ vd apply -f voodu.hcl
 Connect from another app:
 
 ```bash
-vd config set -s myapp REDIS_URL="redis://cache-0.data:6379/0"
+vd config myapp set REDIS_URL="redis://cache-0.data:6379/0"
 ```
 
 ---
@@ -253,9 +253,8 @@ Sentinel-aware restore (auto-coordinate sentinel pause/resume) is a future featu
 **AOF re-enabled (operator override) → restore appears to do nothing.** Redis on boot loads the AOF (with all the operator's pre-restore writes) and ignores the freshly-imported `dump.rdb`. Manual restore that wipes AOF:
 
 ```bash
-PWD=$(vd config get clowk-lp/redis REDIS_PASSWORD)
-ORD=$(vd config get clowk-lp/redis REDIS_MASTER_ORDINAL)
-[ -z "$ORD" ] && ORD=0
+PWD=$(vd config clowk-lp/redis get REDIS_PASSWORD -o json | jq -r .REDIS_PASSWORD)
+ORD=$(vd config clowk-lp/redis get REDIS_MASTER_ORDINAL -o json | jq -r '.REDIS_MASTER_ORDINAL // "0"')
 
 docker stop -t 30 clowk-lp-redis.$ORD
 
@@ -328,9 +327,9 @@ Schedule lives in HCL alongside redis. The cronjob container does the dump + upl
 **Pre-step — declare a shared AWS credentials bucket once:**
 
 ```bash
-vd config set aws/cli AWS_ACCESS_KEY_ID=AKIAxxx
-vd config set aws/cli AWS_SECRET_ACCESS_KEY=secretxxx
-vd config set aws/cli AWS_DEFAULT_REGION=us-east-1
+vd config aws/cli set AWS_ACCESS_KEY_ID=AKIAxxx
+vd config aws/cli set AWS_SECRET_ACCESS_KEY=secretxxx
+vd config aws/cli set AWS_DEFAULT_REGION=us-east-1
 ```
 
 Now any cronjob/job that needs AWS does `env_from = ["aws/cli"]` — no credential duplication across HCL files.
@@ -721,13 +720,13 @@ bin/voodu-redis --version
 JIT-installed by `vd apply` on first apply containing a `redis { … }` block. Pin manually:
 
 ```bash
-vd plugins:install redis --repo thadeu/voodu-redis
+vd plugins:install thadeu/voodu-redis
 ```
 
 **Upgrading from `< v0.13.0` to `v0.13.0+`:** AOF default flipped from `yes` to `no`. After upgrade, Redis on next restart ignores existing AOF files in `/data/appendonlydir/`. To avoid losing writes that exist only in AOF (up to ~60s window), force a `BGSAVE` on each pod BEFORE the upgrade:
 
 ```bash
-PWD=$(vd config get clowk-lp/redis REDIS_PASSWORD)
+PWD=$(vd config clowk-lp/redis get REDIS_PASSWORD -o json | jq -r .REDIS_PASSWORD)
 for i in 0 1 2; do
   docker exec clowk-lp-redis.$i redis-cli -a "$PWD" --no-auth-warning BGSAVE
 done
