@@ -419,18 +419,20 @@ sudo systemctl list-timers redis-backup
 Schedule lives in HCL alongside redis. The cronjob container does the dump + upload directly via `redis-cli` and `aws-cli`, bypassing the plugin command entirely. `env_from` flows `REDIS_PASSWORD` from the data redis bucket — zero credential plumbing.
 
 ```hcl
+asset "clowk-lp" "bkp-file" {
+  entrypoint = file("entrypoint")
+}
+
 cronjob "clowk-lp" "redis-backup" {
   schedule = "0 */6 * * *"
   image    = "amazon/aws-cli:latest"   # has aws-cli, missing redis-cli (we install at boot)
 
   # REDIS_PASSWORD flows in from clowk-lp/redis bucket automatically.
-  env_from = ["clowk-lp/redis"]
+  env_from = ["clowk-lp/redis", "aws/cli"]
 
   env = {
-    AWS_ACCESS_KEY_ID     = "..."   # set via: vd config set clowk-lp/redis-backup AWS_ACCESS_KEY_ID=...
-    AWS_SECRET_ACCESS_KEY = "..."
-    AWS_DEFAULT_REGION    = "us-east-1"
-    # For Cloudflare R2: also set AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+    # send to cloudflare r2
+    AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
   }
 
   command = ["sh", "-c", <<-EOT
@@ -440,6 +442,10 @@ cronjob "clowk-lp" "redis-backup" {
     redis-cli -h redis-2.clowk-lp.voodu -a "$REDIS_PASSWORD" --no-auth-warning --rdb - | \
       aws s3 cp - s3://my-bucket/redis-$(date +%Y%m%d-%H%M%S).rdb
   EOT
+  ]
+
+  volumes = [
+    # "${asset.clowk-lp.bkp-file.entrypoint}:/etc/redis/entrypoint:ro"
   ]
 }
 ```
