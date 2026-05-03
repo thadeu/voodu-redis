@@ -35,6 +35,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -280,36 +281,44 @@ func cmdRestore() error {
 	//      down cleanly. Replicas notice via dropped connection and
 	//      enter "trying to reconnect" state.
 	//
-	//   2. docker cp <local.rdb> <master>:/data/dump.rdb
-	//      Replace the on-disk RDB with our snapshot.
+	//   2. docker run --rm --volumes-from <master> busybox sh -c '
+	//          rm -rf /data/appendonlydir /data/appendonly.aof
+	//          cp /backup/<filename> /data/dump.rdb
+	//          chown -R <owner> /data
+	//      '
+	//      Single ephemeral container does the entire data wipe +
+	//      RDB swap atomically. We can't use `docker exec` here
+	//      because the master is STOPPED — exec only runs against
+	//      running containers. `--volumes-from` works regardless of
+	//      the source container's state.
 	//
-	//   3. Wipe AOF on master (if exists). Without this, Redis on
-	//      restart prefers AOF over RDB → restore would have no effect.
-	//      AOF gets regenerated from the loaded RDB state.
+	//      The wipe touches:
+	//        - /data/appendonlydir/  (Redis 7+ MRA: manifest + base + incr)
+	//        - /data/appendonly.aof  (legacy single-file AOF, may exist on older deploys)
+	//      Without wiping ALL of these, Redis on restart prefers AOF
+	//      (which has the operator's DELETE/FLUSHALL commands) over
+	//      our restored dump.rdb, and the restore is invisible.
 	//
-	//   4. docker start <master>
-	//      Redis boots, sees dump.rdb, loads it. New replication ID
-	//      generated. Replicas reconnect, detect repl-id change,
-	//      perform full SYNC from the restored master state.
+	//   3. docker start <master>
+	//      Redis boots, sees dump.rdb (no AOF to compete), loads it.
+	//      New replication ID generated. Replicas reconnect, detect
+	//      repl-id change, perform full SYNC from the restored
+	//      master state. AOF is recreated from the loaded RDB state
+	//      on the first BGREWRITEAOF or `appendonly yes` reapply.
 	//
-	// Trade-off: master is unavailable for writes during steps 1-4
+	// Trade-off: master is unavailable for writes during steps 1-3
 	// (~5-10 seconds for moderate dataset). Cluster-wide unavailable
 	// during full SYNC if replicas were serving reads.
 	if err := dockerStop(containerName); err != nil {
 		return fmt.Errorf("stop master: %w", err)
 	}
 
-	if err := dockerCpInto(source, containerName, "/data/dump.rdb"); err != nil {
-		return fmt.Errorf("docker cp dump.rdb: %w (master is stopped — start manually with `docker start %s`)", err, containerName)
-	}
-
-	// Wipe AOF so Redis prefers our restored RDB on boot.
-	if err := dockerExecBestEffort(containerName, "rm", "-f", "/data/appendonly.aof", "/data/appendonlydir/appendonly.aof.1.base.rdb"); err != nil {
-		fmt.Fprintf(os.Stderr, "voodu-redis: warning — couldn't wipe AOF (might not exist): %v\n", err)
+	if err := restoreDataVolume(containerName, source); err != nil {
+		return fmt.Errorf("restore data volume: %w (master is stopped — start manually with `docker start %s` or re-run restore)", err, containerName)
 	}
 
 	if err := dockerStart(containerName); err != nil {
-		return fmt.Errorf("start master: %w (data restored to /data/dump.rdb but master is stopped — start manually)", err)
+		return fmt.Errorf("start master: %w (data restored but master is stopped — start manually)", err)
 	}
 
 	fmt.Fprintf(os.Stderr, "voodu-redis: master started — replicas will detect divergent replication ID and full-SYNC automatically\n")
@@ -389,30 +398,93 @@ func dockerStart(container string) error {
 	return cmd.Run()
 }
 
-// dockerCpInto copies a local file into a container at the given
-// destination path. The container can be stopped — docker cp
-// works either way.
-func dockerCpInto(localPath, container, destInContainer string) error {
-	target := container + ":" + destInContainer
+// restoreDataVolume swaps the master pod's /data contents in a
+// single ephemeral container that mounts the master's volumes
+// via --volumes-from. Works against a STOPPED master container —
+// `docker exec` doesn't (only running containers), and `docker
+// cp` alone can't delete files (which we need to wipe AOF).
+//
+// Sequence inside the ephemeral busybox:
+//
+//   1. rm -rf /data/appendonlydir + /data/appendonly.aof
+//      Wipes ALL AOF state. Without this, Redis 7+ on restart
+//      reads the multi-part AOF (manifest + base + incr) and
+//      ignores dump.rdb — restore appears to do nothing because
+//      AOF still has the operator's DELETE/FLUSHALL commands.
+//
+//   2. cp /backup/<rdb-filename> /data/dump.rdb
+//      Replace the on-disk RDB with the snapshot. Master will
+//      load this on startup since AOF is now absent.
+//
+//   3. chown -R <uid:gid> /data
+//      Match the original /data ownership so redis-server (which
+//      runs as redis user, typically uid 999) can read the new
+//      files. Without this, redis-server might fail to load or
+//      warn about permission issues.
+//
+// localRDB must be an absolute path (or one we can resolve) so
+// we can mount its parent dir into the ephemeral container.
+func restoreDataVolume(masterContainer, localRDB string) error {
+	abs, err := filepath.Abs(localRDB)
+	if err != nil {
+		return fmt.Errorf("resolve absolute path of %q: %w", localRDB, err)
+	}
 
-	cmd := exec.Command("docker", "cp", localPath, target)
+	parentDir := filepath.Dir(abs)
+	fileName := filepath.Base(abs)
+
+	owner, ownerErr := dataDirOwner(masterContainer)
+	if ownerErr != nil {
+		// Non-fatal — proceed without chown. If redis can't read,
+		// the operator sees the redis-server log and can chown
+		// manually. Better than aborting before anything happens.
+		fmt.Fprintf(os.Stderr, "voodu-redis: warning — couldn't read /data ownership (%v); skipping chown\n", ownerErr)
+	}
+
+	steps := []string{
+		"set -e",
+		"rm -rf /data/appendonlydir /data/appendonly.aof",
+		fmt.Sprintf("cp /backup/%s /data/dump.rdb", fileName),
+	}
+
+	if owner != "" {
+		steps = append(steps, fmt.Sprintf("chown -R %s /data", owner))
+	}
+
+	script := strings.Join(steps, " && ")
+
+	cmd := exec.Command("docker", "run", "--rm",
+		"--volumes-from", masterContainer,
+		"-v", parentDir+":/backup:ro",
+		"busybox",
+		"sh", "-c", script,
+	)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
 }
 
-// dockerExecBestEffort runs a command in a stopped or running
-// container. Returns the error so caller can decide whether to
-// fail or warn.
-func dockerExecBestEffort(container string, args ...string) error {
-	full := append([]string{"exec", container}, args...)
+// dataDirOwner reads the uid:gid of /data inside the master's
+// volume namespace. Used by restoreDataVolume to chown the
+// freshly-copied dump.rdb so redis-server (running as the
+// non-root redis user) can read it.
+func dataDirOwner(container string) (string, error) {
+	cmd := exec.Command("docker", "run", "--rm",
+		"--volumes-from", container,
+		"busybox",
+		"stat", "-c", "%u:%g", "/data",
+	)
 
-	cmd := exec.Command("docker", full...)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	return cmd.Run()
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("stat /data: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
 }
 
 // detectSentinelWatching probes for a sentinel-mode redis resource
