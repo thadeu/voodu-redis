@@ -1,5 +1,5 @@
 name: redis
-version: 0.10.12
+version: 0.11.0
 description: >
   Voodu macro plugin that expands redis { ... } HCL blocks into a
   fan-out (asset + statefulset) with a production-ready redis.conf.

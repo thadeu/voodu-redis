@@ -229,6 +229,109 @@ If you had used `--sentinel` on consumer links, re-run them
 without the flag (or `vd redis:unlink` then re-link). The plain
 `REDIS_URL` keeps working.
 
+## Failure modes & recovery
+
+### Single master crash (the common case)
+
+The whole reason sentinel exists. Timeline:
+
+| T | Event |
+|---|-------|
+| 0s | Master pod crashes |
+| ~5s | Sentinels mark master `+sdown` (pings fail for `down-after-milliseconds`) |
+| ~5s | Quorum (2/3) agrees → `+odown` |
+| ~7s | Leader sentinel elected |
+| ~10s | Replica selected, promoted (`SLAVEOF NO ONE`) |
+| ~12s | Other replicas reconfigured to new master |
+| ~13s | `+switch-master` fires, hook posts to voodu controller |
+| ~13s | `REDIS_MASTER_ORDINAL` updated in voodu store |
+| ~15-30s | Linked consumers' env files re-emitted, containers rolling-restart |
+| ~30-60s | Voodu reconciler respawns the dead pod, joins as replica of new master |
+
+**Operator does nothing.** Apps using `--sentinel`-aware client reconnect within seconds; apps using plain `REDIS_URL` see ~15-30s blip from container restart.
+
+### Master + all replicas down (catastrophic, very unlikely)
+
+If somehow every redis pod is dead simultaneously, sentinel can't promote — no candidate. Recovery:
+
+```bash
+# 1. Identify any pod that's actually running (or bring one back)
+docker ps --filter "name=clowk-lp-redis" --filter "status=running"
+# Or force-spawn one via vd
+vd start clowk-lp/redis.0
+
+# 2. Tell voodu the survivor is now master
+vd redis:failover clowk-lp/redis --replica 0 --no-restart
+
+# 3. Roll the data redis pods so they re-read the new master ordinal
+vd restart clowk-lp/redis
+```
+
+### Sentinel state divergent from reality (after rapid chained failures)
+
+If you've killed several masters in succession (testing or real cascade failure), sentinel can end up with:
+- Wrong "current master" in its memory
+- Replicas marked `s_down` permanently
+- `flags = master,disconnected` stuck without progressing to `+sdown`
+- `vd redis:info` for sentinel showing different ordinal than for data redis
+
+Sentinel's internal state has too much accumulated history. Reset:
+
+```bash
+# Force every sentinel to forget its current view and re-discover
+for i in 0 1 2; do
+  vd exec clowk-lp/redis-ha.$i -- redis-cli -p 26379 SENTINEL RESET voodu-master
+done
+
+# Wait 15-30s — sentinels will re-discover via INFO replication and pubsub
+sleep 30
+
+# Verify state is healthy
+vd exec clowk-lp/redis-ha.0 -- redis-cli -p 26379 SENTINEL master voodu-master | grep -A1 "^flags|^num-slaves|^num-other-sentinels"
+```
+
+If still stuck after `SENTINEL RESET`, manual catch-up:
+
+```bash
+# Find which redis pod is actually master (or pick any healthy one)
+PWD=$(vd config get clowk-lp/redis REDIS_PASSWORD)
+for i in 0 1 2; do
+  echo "═══ redis-$i ═══"
+  vd exec clowk-lp/redis.$i -- redis-cli -a "$PWD" INFO replication 2>/dev/null | grep "^role"
+done
+
+# Force voodu store + reconfigure pods
+vd redis:failover clowk-lp/redis --replica <healthy-ord> --no-restart
+vd restart clowk-lp/redis
+```
+
+### Controller restart endpoint hangs
+
+If `vd restart clowk-lp/redis-ha` times out with `context deadline exceeded`, the controller is blocked on a docker operation. Recovery:
+
+```bash
+# Force-remove stuck containers
+docker rm -f $(docker ps -aq --filter "name=clowk-lp-redis-ha")
+
+# Restart the controller to release internal locks
+sudo systemctl restart voodu-controller
+
+# Re-apply to spawn fresh containers
+vd apply -f sentinel.hcl
+```
+
+This is rare — only happens after invasive manual interventions (chained `docker kill` or `docker rm` while reconciler is mid-flight).
+
+### Why sentinel struggles with rapid failures
+
+Sentinel was designed for **occasional failover** (master crashes once a month/year). Its state machine accumulates:
+- `known-replica` for every replica it's ever seen
+- `known-sentinel` for every peer
+- Epoch bumps on every election
+- Cooldowns to prevent flapping
+
+Rapid sequential failures (testing or genuine cascade) overflow these state buffers and Sentinel can lose track. **In production this almost never happens** — failures are sparse enough for sentinel to digest each one cleanly. For chaos testing, expect to use `SENTINEL RESET` or manual `vd redis:failover --no-restart` as recovery levers.
+
 ## Same-VM vs multi-VM
 
 This example assumes everything runs on one VM with voodu0 as
