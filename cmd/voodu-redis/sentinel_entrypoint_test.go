@@ -167,21 +167,15 @@ func TestRenderSentinelEntrypointScript_PreflightCheck(t *testing.T) {
 // the "REDIS_PASSWORD set AND not already in conf → emit
 // auth-pass; not set OR already present → skip" flow.
 //
-// Two-level guard:
-//   - REDIS_PASSWORD env must be non-empty (otherwise we'd emit
-//     `sentinel auth-pass mymaster ` — invalid)
-//   - persistent conf must NOT already have an auth-pass line
-//     (otherwise restart appends duplicate, conf grows on each
-//     boot)
+// Single guard now (REDIS_PASSWORD non-empty) — duplicate guard
+// is unnecessary because the conf is fully rewritten on every
+// boot (always-rewrite-bootstrap pattern). Each boot writes
+// fresh, no append-on-restart growth concern.
 func TestRenderSentinelEntrypointScript_AuthPassConditional(t *testing.T) {
 	script := renderSentinelEntrypointScript()
 
 	if !strings.Contains(script, `if [ -n "${REDIS_PASSWORD:-}" ]`) {
 		t.Errorf("auth-pass should be conditional on REDIS_PASSWORD being non-empty")
-	}
-
-	if !strings.Contains(script, `grep -q "^sentinel auth-pass "`) {
-		t.Errorf("auth-pass should be skipped when already present in persistent conf (avoids duplicates on restart)")
 	}
 
 	if !strings.Contains(script, "sentinel auth-pass mymaster $REDIS_PASSWORD") {
@@ -214,30 +208,44 @@ func TestRenderSentinelEntrypointScript_ExecsRedisServerWithSentinel(t *testing.
 	}
 }
 
-// TestRenderSentinelEntrypointScript_PersistentBootstrapOnlyIfEmpty
-// pins THE fix for the bootstrap deadlock — sentinels boot with
-// the master DOWN can't discover peers via pubsub, can't reach
-// quorum, can't fail over. Persisting the runtime conf across
-// restarts (volume_claim mounted at /var/lib/sentinel/) means
-// peers + replicas survive pod recreation, so the new sentinel
-// doesn't need to re-discover.
+// TestRenderSentinelEntrypointScript_RewriteBootstrapPreserveDiscoveredState
+// pins the dual-goal pattern that makes both plugin updates AND
+// the bootstrap-deadlock-fix work together:
 //
-// Pattern: bootstrap only if the persistent file is missing/empty.
-// First boot writes fresh conf; subsequent boots reuse the conf
-// sentinel has been rewriting at runtime with discovered state.
-func TestRenderSentinelEntrypointScript_PersistentBootstrapOnlyIfEmpty(t *testing.T) {
+//  1. ALWAYS rewrite bootstrap directives (monitor, quorum, hook
+//     path, down-after-ms, etc.) — picks up plugin upgrades and
+//     HCL changes WITHOUT operator wiping the volume.
+//
+//  2. PRESERVE sentinel-managed state lines (known-sentinel,
+//     known-replica, current-epoch, etc.) — keeps the discovered
+//     topology across pod restart, so the next boot can reach
+//     quorum even if master is currently down.
+//
+// The earlier "bootstrap only if empty" pattern broke #1: any plugin
+// or HCL change required `docker volume rm` to take effect. Now
+// operator iterates freely, sentinel still survives master outages
+// during restart.
+func TestRenderSentinelEntrypointScript_RewriteBootstrapPreserveDiscoveredState(t *testing.T) {
 	script := renderSentinelEntrypointScript()
 
 	if !strings.Contains(script, sentinelStatePath) {
 		t.Errorf("entrypoint should write conf to persistent path %q", sentinelStatePath)
 	}
 
-	if !strings.Contains(script, `if [ ! -s "$CONF" ]; then`) {
-		t.Errorf("entrypoint should bootstrap only when persistent conf is empty/missing")
+	// Bootstrap is ALWAYS rewritten now — no `if empty` guard.
+	if strings.Contains(script, `if [ ! -s "$CONF" ]; then`) {
+		t.Errorf("entrypoint regressed to bootstrap-only-if-empty; should always rewrite to pick up plugin updates")
 	}
 
-	if !strings.Contains(script, "reusing persistent sentinel.conf") {
-		t.Errorf("entrypoint should log when reusing persistent state (operator visibility)")
+	// Pre-extract the discovered state lines from the prior conf.
+	if !strings.Contains(script, `PRESERVED=$(grep -E`) {
+		t.Errorf("entrypoint should extract sentinel-managed state lines (known-sentinel/replica, epochs) before rewriting")
+	}
+
+	// Re-append preserved lines after bootstrap so sentinel resumes
+	// with prior topology knowledge.
+	if !strings.Contains(script, `echo "$PRESERVED" >> "$CONF"`) {
+		t.Errorf("entrypoint should re-append preserved state after bootstrap rewrite")
 	}
 }
 

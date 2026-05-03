@@ -187,21 +187,32 @@ fi
 CONF=` + sentinelStatePath + `
 mkdir -p ` + sentinelStateDir + ` /etc/sentinel/conf.d
 
-# Bootstrap-only-if-empty: persisted sentinel.conf survives pod
-# restart so sentinels remember discovered peers + replicas (avoids
-# the bootstrap deadlock when master is down at sentinel boot —
-# without persistent state, sentinels can't discover peers via
-# the master's pubsub, can't reach quorum, no failover).
+# Always-rewrite-bootstrap, preserve-discovered-state. Two goals:
 #
-# Empty/missing file → write fresh bootstrap.
-# Existing non-empty file → use as-is, sentinel rewrites it at
-# runtime with observed state.
+#  1. Plugin updates take effect WITHOUT operator wiping the volume —
+#     bootstrap directives (monitor, hook path, down-after, quorum,
+#     auth-pass) get rewritten on every boot, picking up whatever
+#     the current plugin version emits.
 #
-# Operator-override .conf files at /etc/sentinel/conf.d/* are
-# always re-included on every boot regardless of bootstrap state.
-if [ ! -s "$CONF" ]; then
-    echo "voodu-sentinel: persistent state empty, writing bootstrap conf to $CONF" >&2
-    cat > "$CONF" <<EOF
+#  2. Discovered topology (peers + replicas + epoch) survives across
+#     pod restart. Sentinel discovers peers via master's pubsub on
+#     INFO replication. If a sentinel boots while master is DOWN,
+#     it can't discover anything — no quorum, no failover. Persisting
+#     known-sentinel/known-replica/current-epoch lines from the
+#     previous boot avoids that bootstrap deadlock.
+#
+# Pattern: extract sentinel-managed state lines from old conf, write
+# fresh bootstrap with operator/plugin directives, append the
+# preserved state lines at the end.
+PRESERVED=""
+if [ -s "$CONF" ]; then
+    PRESERVED=$(grep -E "^sentinel (known-sentinel|known-replica|config-epoch|leader-epoch|master-config-epoch)|^current-epoch" "$CONF" 2>/dev/null || true)
+    if [ -n "$PRESERVED" ]; then
+        echo "voodu-sentinel: preserving $(echo "$PRESERVED" | wc -l) discovered-state lines from prior boot" >&2
+    fi
+fi
+
+cat > "$CONF" <<EOF
 port ` + fmt.Sprintf("%d", sentinelPort) + `
 sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
@@ -212,18 +223,19 @@ sentinel parallel-syncs ` + sentinelMasterName + ` 1
 sentinel client-reconfig-script ` + sentinelMasterName + ` ` + sentinelHookMountPath + `
 include /etc/sentinel/conf.d/*.conf
 EOF
-else
-    echo "voodu-sentinel: reusing persistent sentinel.conf at $CONF (preserves discovered peers/replicas across restart)" >&2
+
+# auth-pass — operator-managed via REDIS_PASSWORD env (env_from from
+# monitor target). Always written fresh as part of the bootstrap;
+# password rotations propagate naturally without operator gymnastics.
+if [ -n "${REDIS_PASSWORD:-}" ]; then
+    echo "sentinel auth-pass ` + sentinelMasterName + ` $REDIS_PASSWORD" >> "$CONF"
 fi
 
-# auth-pass is opt-in via REDIS_PASSWORD env (flows in via env_from
-# from the monitor target's bucket). Written to the persistent
-# conf only on first bootstrap to avoid appending duplicates on
-# every restart. Password rotation post-bootstrap requires either
-# a SENTINEL SET auth-pass via redis-cli OR a wipe of the
-# persistent volume to re-bootstrap.
-if [ -n "${REDIS_PASSWORD:-}" ] && ! grep -q "^sentinel auth-pass " "$CONF" 2>/dev/null; then
-    echo "sentinel auth-pass ` + sentinelMasterName + ` $REDIS_PASSWORD" >> "$CONF"
+# Append discovered-state lines AFTER bootstrap directives so sentinel
+# resumes with prior topology knowledge rather than re-discovering
+# from scratch (which can deadlock when master is down at boot).
+if [ -n "$PRESERVED" ]; then
+    echo "$PRESERVED" >> "$CONF"
 fi
 
 echo "voodu-sentinel: monitoring ${VOODU_MONITOR_SCOPE}/${VOODU_MONITOR_NAME} master=$MASTER_HOST:6379 quorum=$QUORUM (replicas=$VOODU_REDIS_REPLICAS)" >&2
