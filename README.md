@@ -105,7 +105,81 @@ But know that re-enabling AOF means future `vd redis:restore` calls need manual 
 redis "data" "cache" {}
 ```
 
-Hardened single-node redis. Done.
+Hardened single-node redis. Done. What this gives you:
+
+- `image = "redis:8"` (latest stable; override to pin)
+- `replicas = 1` (single node)
+- `command` invokes the role-aware entrypoint wrapper
+- `ports = ["6379"]` (loopback by default)
+- `volume_claims`: `data` at `/data` (per-pod, statefulset-style)
+- `volumes`: `redis.conf` + entrypoint script bind-mounted from plugin assets
+- **`probes`**: kubelet-style liveness + readiness — see next section
+
+### Default probes (since 0.14.0)
+
+Bare `redis "data" "cache" {}` ships with these probes pre-wired so the operator doesn't boot redis blind. The values catch the two real-world failure modes redis exhibits: process hang (TCP socket open but no responses) and AOF/RDB loading state (TCP socket open but commands return `LOADING`).
+
+| probe | selector | timing |
+|---|---|---|
+| liveness | `tcp_socket { port = 6379 }` | `period = "10s"`, `failure_threshold = 3` |
+| readiness | `exec { command = ["redis-cli", "ping"] }` | `period = "5s"`, `failure_threshold = 1`, `success_threshold = 2` |
+
+**Why these defaults:**
+
+- **Liveness via TCP**: cheapest possible probe — no auth concerns, no command fork. The port being open == redis daemon alive. 3 consecutive 10s failures (~30s window) before docker restart tolerates one-off GC pauses without crash-looping.
+- **Readiness via `redis-cli ping`**: strict "actually serving" signal. The `LOADING` state during AOF/RDB replay on boot returns a non-PONG response and `redis-cli` exits non-zero — caddy / consumer apps bypass the upstream until redis is actually ready for traffic. A pure TCP probe would miss this entirely and route traffic to a redis that 503s every command.
+- **`success_threshold = 2` on readiness**: two consecutive passes to come back avoids routing-flap during brief recovery windows (e.g. a hiccup between AOF chunks).
+
+**Override:**
+
+Declaring **any** `probes { ... }` block in the HCL replaces the default entirely (no sub-block merging — operator-declared partial probes do NOT inherit the plugin's defaults for the slots they didn't declare). If you want to override one probe and keep the other, redeclare both:
+
+```hcl
+redis "data" "cache" {
+  probes {
+    # Custom liveness — e.g. swap to http_get if you front
+    # redis with a sidecar exposing /healthz on 9121
+    liveness {
+      http_get {
+        path = "/healthz"
+        port = 9121
+      }
+      period = "15s"
+    }
+
+    # Redeclare the plugin default to keep it
+    readiness {
+      exec { command = ["redis-cli", "ping"] }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+**Authenticated redis:** if your redis requires `AUTH` (set via `requirepass` in the conf), pass the password to `redis-cli`:
+
+```hcl
+redis "data" "cache" {
+  probes {
+    readiness {
+      exec {
+        command = ["redis-cli", "-a", "$REDIS_PASSWORD", "--no-auth-warning", "ping"]
+      }
+      period            = "5s"
+      failure_threshold = 1
+      success_threshold = 2
+    }
+  }
+}
+```
+
+The `$REDIS_PASSWORD` is read from the container's env at probe time — same env the operator wires via `env_from` or `vd config set`.
+
+**Disabling probes entirely:** declare `probes {}` with no sub-blocks — voodu accepts an empty `probes` block and runs nothing.
+
+**Upgrade note (from < 0.14.0):** the first `vd apply` after upgrading the plugin re-renders the statefulset with probes attached, which flips the spec hash and triggers one top-down rolling restart per ordinal. Per-pod data survives via the existing per-ordinal `data` volume claim; the restart is cosmetic.
 
 #### Level 2 — override statefulset attrs
 
