@@ -343,6 +343,115 @@ func TestComposeDefaults_HasRequiredFields(t *testing.T) {
 	}
 }
 
+// TestComposeDefaults_IncludesProbes pins that an empty
+// `redis "scope" "name" {}` gets a kubelet-style probe set
+// out of the box. Without this an operator boots redis blind
+// — no liveness restart on hang, no readiness gating during
+// AOF/RDB load. This is the headline UX the plugin delivers
+// over a hand-rolled statefulset declaration.
+func TestComposeDefaults_IncludesProbes(t *testing.T) {
+	d := composeDefaults("data", "cache")
+
+	probes, ok := d["probes"].(map[string]any)
+	if !ok {
+		t.Fatalf("probes field missing or wrong type: %T", d["probes"])
+	}
+
+	// Liveness: TCP socket. Cheapest possible probe shape.
+	liveness, ok := probes["liveness"].(map[string]any)
+	if !ok {
+		t.Fatalf("liveness sub-block missing: %+v", probes)
+	}
+
+	tcp, ok := liveness["tcp_socket"].(map[string]any)
+	if !ok {
+		t.Fatalf("liveness.tcp_socket missing: %+v", liveness)
+	}
+
+	if tcp["port"] != 6379 {
+		t.Errorf("liveness port: got %v, want 6379", tcp["port"])
+	}
+
+	if liveness["period"] != "10s" {
+		t.Errorf("liveness period: got %v, want 10s", liveness["period"])
+	}
+
+	if liveness["failure_threshold"] != 3 {
+		t.Errorf("liveness failure_threshold: got %v, want 3", liveness["failure_threshold"])
+	}
+
+	// Readiness: `redis-cli ping` exec. Catches AOF-loading
+	// state. The command must be a []any (HCL/JSON list shape).
+	readiness, ok := probes["readiness"].(map[string]any)
+	if !ok {
+		t.Fatalf("readiness sub-block missing: %+v", probes)
+	}
+
+	exec, ok := readiness["exec"].(map[string]any)
+	if !ok {
+		t.Fatalf("readiness.exec missing: %+v", readiness)
+	}
+
+	cmd, ok := exec["command"].([]any)
+	if !ok || len(cmd) != 2 || cmd[0] != "redis-cli" || cmd[1] != "ping" {
+		t.Errorf("readiness command: got %+v, want [redis-cli, ping]", cmd)
+	}
+
+	if readiness["success_threshold"] != 2 {
+		t.Errorf("readiness success_threshold: got %v, want 2", readiness["success_threshold"])
+	}
+}
+
+// TestMergeSpec_OperatorProbesReplacesDefault pins the
+// override semantics: declaring any `probes { ... }` block
+// in HCL fully replaces the plugin's default probes. No
+// merging at the sub-block level, by design — mixing operator
+// liveness with plugin readiness would produce surprising
+// hybrids (e.g. operator switches to http_get on a metrics
+// sidecar but inherits exec readiness that doesn't apply).
+//
+// If/when partial overrides become a real ask, this test
+// flips and we add a per-sub-block merger. For now: total
+// replacement, document the constraint in the example.
+func TestMergeSpec_OperatorProbesReplacesDefault(t *testing.T) {
+	defaults := composeDefaults("data", "cache")
+
+	operator := map[string]any{
+		"image": "redis:7.4-alpine",
+		"probes": map[string]any{
+			// Only liveness — operator's choice. Plugin's
+			// default readiness should be GONE after merge.
+			"liveness": map[string]any{
+				"tcp_socket": map[string]any{"port": 6379},
+				"period":     "30s", // operator's looser cadence
+			},
+		},
+	}
+
+	merged := mergeSpec(defaults, operator)
+
+	probes, ok := merged["probes"].(map[string]any)
+	if !ok {
+		t.Fatalf("probes lost in merge: %+v", merged)
+	}
+
+	// Operator's liveness present
+	liveness, ok := probes["liveness"].(map[string]any)
+	if !ok {
+		t.Fatalf("operator liveness lost: %+v", probes)
+	}
+
+	if liveness["period"] != "30s" {
+		t.Errorf("operator override not in effect: %+v", liveness)
+	}
+
+	// Plugin's default readiness MUST NOT survive — total
+	// override on the probes block.
+	if _, lingering := probes["readiness"]; lingering {
+		t.Errorf("plugin readiness leaked through after operator override: %+v", probes)
+	}
+}
+
 // TestCheckScaleDownDoesNotOrphanMaster pins the orphan-cluster
 // guard. Operator can't apply replicas=N while REDIS_MASTER_ORDINAL
 // >= N — that would silently prune the master, leaving the

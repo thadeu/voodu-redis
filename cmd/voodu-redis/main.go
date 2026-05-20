@@ -546,6 +546,53 @@ func composeDefaults(scope, name string) map[string]any {
 				"mount_path": "/data",
 			},
 		},
+		// Default probes — kubelet-style health checks the operator
+		// gets for free with `redis "scope" "name" {}`. TCP liveness
+		// catches "process hung, port closed"; exec readiness via
+		// `redis-cli ping` catches the "loading AOF/RDB at boot"
+		// state (port open but commands return LOADING) that a pure
+		// TCP probe would miss.
+		//
+		// Operator override semantics: declaring ANY `probes { ... }`
+		// block in HCL replaces this default entirely (mergeSpec
+		// total-override on top-level keys). To override one probe
+		// and keep the other, the operator redeclares both.
+		"probes": composeDefaultProbes(),
+	}
+}
+
+// composeDefaultProbes returns the kubelet-style probe set shipped
+// out of the box for `redis "x" "y" {}`. Lives as a free function
+// (not a literal in composeDefaults) so the test surface can
+// assert on it directly without re-typing the entire map.
+//
+// Liveness: tcp_socket on 6379. Cheapest possible — no auth
+// concerns, no command fork. Catches "process crashed / hung".
+// 10s period × failure_threshold 3 = ~30s before docker
+// restart, tolerates one-off GC pauses.
+//
+// Readiness: `redis-cli ping`. Strict "actually serving" signal.
+// `LOADING` (post-restart AOF replay) returns non-PONG and the
+// exec exits non-zero, so caddy bypasses the upstream until the
+// load completes. 5s period + success_threshold 2 avoids
+// routing-flap during a brief recovery.
+func composeDefaultProbes() map[string]any {
+	return map[string]any{
+		"liveness": map[string]any{
+			"tcp_socket": map[string]any{
+				"port": 6379,
+			},
+			"period":            "10s",
+			"failure_threshold": 3,
+		},
+		"readiness": map[string]any{
+			"exec": map[string]any{
+				"command": []any{"redis-cli", "ping"},
+			},
+			"period":            "5s",
+			"failure_threshold": 1,
+			"success_threshold": 2,
+		},
 	}
 }
 
